@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import N_POINTS, PointCloudDataset, compute_class_counts
-from losses import compute_class_weights
+from losses import compute_class_weights, make_pointnet2_loss_fn
 from models.pointnet2 import LATENT_DIM, NUM_CLASSES, PointNet2MultiTask
 from train_utils import fit, validate
 
@@ -109,14 +109,15 @@ def main():
         torch.save(model.state_dict(), args.outputs_dir / "best_multitask_model.pt")
         print(f"  (epoch {epoch}: new best, checkpoint saved to {args.outputs_dir})", flush=True)
 
+    loss_fn = make_pointnet2_loss_fn(chamfer_target_subsample=args.chamfer_target_subsample)
+
     print(f"\nStarting training: {N_POINTS} points/sample, batch_size={args.batch_size}, "
           f"lambda_class={args.lambda_class}")
     try:
         es = fit(
             model=model, train_loader=train_loader, val_loader=val_loader, optimizer=optimizer,
-            class_weights=class_weights, lambda_class=args.lambda_class,
-            chamfer_target_subsample=args.chamfer_target_subsample, device=device,
-            max_epochs=args.max_epochs, patience=args.patience, log_fn=log,
+            class_weights=class_weights, lambda_class=args.lambda_class, device=device,
+            max_epochs=args.max_epochs, patience=args.patience, loss_fn=loss_fn, log_fn=log,
             on_new_best=save_checkpoint,
         )
     except torch.cuda.OutOfMemoryError:
@@ -129,7 +130,7 @@ def main():
 
     print(f"\nBest val loss: {es.best_val_loss:.5f}")
     held_out_recon, held_out_class = validate(
-        model, val_loader, class_weights, args.lambda_class, args.chamfer_target_subsample, device
+        model, val_loader, class_weights, args.lambda_class, device, loss_fn
     )
     print(f"Held-out validation: recon {held_out_recon:.5f}, class {held_out_class:.5f}")
 
