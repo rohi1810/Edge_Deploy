@@ -11,11 +11,31 @@
       return;
     }
 
+    /* Every payload URL carries the manifest's build stamp.
+     *
+     * build_demo.py regenerates payloads in place under the same filenames:
+     * frames/0042.png is a different image after a rebuild and metrics.js holds
+     * different numbers, so a browser that has any of them cached by name will
+     * go on showing the old ones. That is not theoretical -- the page rendered
+     * "transcribed, not regenerated at build time" from a cached metrics.js
+     * while the server was already serving the measured one.
+     *
+     * A server can fix this with cache headers, and nginx-demo.conf does. But
+     * the demo's two other delivery modes cannot: opened as a file:// folder
+     * there is no server at all, and on GitHub Pages the headers are not ours.
+     * Putting the stamp in the URL is the only fix that works in all three.
+     *
+     * index.html and manifest.js themselves still need server-side no-cache --
+     * nothing can version the URL that carries the version.
+     */
+    var build = manifest.generatedAt || manifest.schemaVersion || '1';
+    var stamp = '?v=' + encodeURIComponent(build);
+
     var ctx = {
       manifest: manifest,
       classes: manifest.classes || [],
       metrics: null,
-      resolve: function (rel) { return 'payloads/' + rel; }
+      resolve: function (rel) { return 'payloads/' + rel + stamp; }
     };
 
     var nav = document.getElementById('nav');

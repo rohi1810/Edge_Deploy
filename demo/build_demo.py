@@ -814,6 +814,31 @@ EXPORTERS = {
 }
 
 
+def stamp_manifest_build() -> None:
+    """Bump the manifest's generatedAt after anything is re-exported.
+
+    app.js appends this value to every payload URL as ?v=, which is what stops
+    a browser serving yesterday's frames or numbers from cache after a rebuild.
+    That only works if the value actually moves when the payloads do -- leaving
+    it to be updated by hand is exactly the kind of step that gets skipped on
+    the morning of a defense.
+
+    Edited in place with a targeted replacement rather than rewritten from a
+    dict: manifest.js is hand-authored and its comments are the documentation
+    for how to add a section.
+    """
+    import re
+    path = PAYLOADS / "manifest.js"
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8")
+    today = _dt.date.today().isoformat()
+    new, n = re.subn(r'("generatedAt"\s*:\s*")[^"]*(")', rf'\g<1>{today}\g<2>', text, count=1)
+    if n and new != text:
+        path.write_text(new, encoding="utf-8")
+        print(f"manifest generatedAt -> {today} (cache-busts payload URLs)")
+
+
 def run_exports(sources: dict, only: list[str] | None) -> int:
     done, skipped, failed = [], [], []
 
@@ -842,6 +867,9 @@ def run_exports(sources: dict, only: list[str] | None) -> int:
                 skipped.append(f"{kind}:{ident} -- {e}")
             except Exception as e:  # noqa: BLE001 -- report and continue
                 failed.append(f"{kind}:{ident} -- {type(e).__name__}: {e}")
+
+    if done:
+        stamp_manifest_build()
 
     print("\n--- export summary ---")
     for d in done:

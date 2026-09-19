@@ -224,10 +224,12 @@
       var mime = 'image/' + (f.format || 'png');
       return function (i) { return 'data:' + mime + ';base64,' + data[i]; };
     }
-    var base = ctx.resolve(f.base || '');
+    /* resolve() the COMPLETE relative path, never a prefix of one: it appends a
+       ?v= build stamp, which would otherwise land in the middle of the URL. */
+    var base = f.base || '';
     var ext = '.' + (f.format || 'png');
     var pad = f.pad || 4;
-    return function (i) { return base + '/' + DEMO.pad(i, pad) + ext; };
+    return function (i) { return ctx.resolve(base + '/' + DEMO.pad(i, pad) + ext); };
   }
 
   function describeRows(payload) {

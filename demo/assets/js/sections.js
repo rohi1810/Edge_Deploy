@@ -132,12 +132,15 @@
     if (p.sharedMaxRange) bits.push('shared max_range ' + p.sharedMaxRange.toFixed(3) + ' m');
     var text = bits.join(' · ');
     var manual = p.source === 'manual';
+    var script = p.script || 'the pipeline';
+    if (p.generatedAt) bits.push(p.generatedAt);
+    text = bits.join(' · ');
     return el('p.note', null, [
       el('strong', { text: manual ? 'Provenance: ' : 'Measured: ' }),
       document.createTextNode(
         text + (manual
-          ? ' — transcribed from a recorded run of kevin_pipeline/fair_comparison.py, not regenerated at build time.'
-          : ' — regenerated at build time by ' + (p.source || 'the pipeline') + '.')
+          ? ' — transcribed from a recorded run of ' + script + ', not regenerated at build time.'
+          : ' — written directly by ' + script + '; no number on this page was typed by hand.')
       )
     ]);
   }
