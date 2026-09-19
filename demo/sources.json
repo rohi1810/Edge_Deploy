@@ -140,6 +140,18 @@
       "posterAt": 4.0
     }
   ],
+  "metrics": {
+    "_comment": [
+      "Numbers only -- the prose lives in demo/metrics_template.json, which",
+      "also documents the two commands that produce these two files. Both are",
+      "under /outputs (gitignored), so on a fresh clone this exporter skips and",
+      "the committed payloads/metrics.js is kept."
+    ],
+    "id": "metrics",
+    "fairComparisonJson": "outputs/measured/fair_comparison.json",
+    "evaluateJson": "outputs/measured/evaluate_pointnet2.json"
+  },
+
   "gallery": {
     "from": [
       "outputs/pointnet2/range_heatmaps",

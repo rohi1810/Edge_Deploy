@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime as _dt
 import importlib
 import json
 import shutil
@@ -687,6 +688,70 @@ def export_gallery(cfg: dict) -> str:
     return f"gallery: copied {copied} figures"
 
 
+def export_metrics(cfg: dict) -> str:
+    """Fuse the authored metrics template with what the scripts measured.
+
+    Prose is written by a person; every number is read from the JSON that
+    fair_comparison.py and evaluate.py emit. Nothing in between -- so a figure
+    on the page cannot be one that someone typed, transcribed or forgot to
+    update after retraining. Needs no torch: it reads JSON and writes JSON.
+    """
+    template_path = need(DEMO_DIR / "metrics_template.json", "metrics template")
+    fair_path = REPO_ROOT / cfg["fairComparisonJson"]
+    eval_path = REPO_ROOT / cfg["evaluateJson"]
+    need(fair_path, "fair_comparison --json-out (see metrics_template.json header)")
+    need(eval_path, "evaluate --json-out (see metrics_template.json header)")
+
+    with open(template_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    with open(fair_path, encoding="utf-8") as f:
+        fair = json.load(f)
+    with open(eval_path, encoding="utf-8") as f:
+        ev = json.load(f)
+
+    missing = [m["id"] for m in payload["models"] if m["id"] not in fair["models"]]
+    if missing:
+        raise Skip(f"{fair_path.name} has no numbers for {missing} -- rerun fair_comparison.py")
+
+    for m in payload["models"]:
+        m["metrics"] = fair["models"][m["id"]]
+
+    threshold = payload["provenance"]["classConfThreshold"]
+    if abs(ev.get("threshold", 0) - threshold) > 1e-9:
+        # Tabling per-class F1 measured at one threshold under a page that
+        # states another is precisely the kind of quiet mismatch an examiner
+        # finds and you cannot explain on the spot.
+        raise Skip(f"{eval_path.name} was measured at threshold {ev.get('threshold')} "
+                   f"but the template states {threshold} -- rerun evaluate.py "
+                   f"with --class-conf-threshold {threshold}")
+
+    payload["provenance"].update({
+        "source": "measured",
+        "script": fair["script"],
+        "testSamples": fair["testSamples"],
+        "sharedMaxRange": fair["sharedMaxRange"],
+        "generatedAt": _dt.date.today().isoformat(),
+    })
+    payload["perClass"] = {
+        "model": payload["perClass"]["model"],
+        "script": ev["script"],
+        "threshold": threshold,
+        "macroF1": ev["macroF1"],
+        # Environment is excluded: at ~99% of all points its F1 is ~0.999 and
+        # it crowds out the four rows that carry the actual signal.
+        "rows": [{"classId": r["classId"], "name": r["name"], "precision": r["precision"],
+                  "recall": r["recall"], "f1": r["f1"]}
+                 for r in ev["rows"] if r["classId"] > 0],
+    }
+    payload.pop("_comment", None)
+    payload["comparison"].pop("_comment", None)
+
+    write_payload("metrics.js", "metrics", "main", payload)
+    n = len(payload["perClass"]["rows"])
+    return (f"metrics: {len(payload['models'])} models from {fair_path.name}, "
+            f"{n} per-class rows from {eval_path.name} @ threshold {threshold}")
+
+
 # --------------------------------------------------------------------------
 # validation / reporting
 # --------------------------------------------------------------------------
@@ -745,6 +810,7 @@ EXPORTERS = {
     "gallery": ("gallery", export_gallery),
     "tunnel": ("tunnel", export_tunnel),
     "pointcloud": ("pointclouds", export_pointcloud),
+    "metrics": ("metrics", export_metrics),
 }
 
 

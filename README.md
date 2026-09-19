@@ -1,153 +1,129 @@
-# sim2real-lidar — PointNet++ candidate
+# sim2real-lidar
 
-## What this project is
+Compress a LiDAR scan into a compact latent vector a downstream reinforcement-learning
+policy can consume as its observation — and find out whether an encoder trained
+entirely in simulation still behaves sensibly on a real sensor.
 
-This is one of three candidate encoders being compared for a LiDAR-based perception
-system: compress a LiDAR scan into a compact latent vector that a downstream
-reinforcement-learning policy can consume as its observation, while also — during
-training only — being pushed to encode *semantically* meaningful information (what
-kind of object each point belongs to), not just raw geometry.
+Three candidate encoders share one contract, `encode(scan) -> (B, 256)`, are trained on
+the same simulated dataset, and are scored on the same held-out split:
 
-The three candidates share one contract: `encode(scan) -> (B, 256)`. The other two
-are a CNN autoencoder (baseline, modeled on a known-working architecture used
-elsewhere in this group) and a CNN-VAE variant. This repo is the third: a **PointNet++
-encoder operating directly on raw 3D points**, rather than on a 2D range-image
-projection. All three get trained on identical simulated data and compared on the
-same held-out set, and eventually on real data captured from the same physical
-tunnel.
+| candidate | representation | reconstruction | classification | where |
+|---|---|---|---|---|
+| **PointNet++** | raw 3D points | Chamfer, free-form 2,048 points | per-point, 8-class head | `models/pointnet2.py` |
+| **CNN autoencoder** | `(64,1024)` range image | native grid | **none** — never had one | sibling repo, loaded via `viz/gen_playback_kevin.py` |
+| **SalsaNext** | `(64,1024)` range image | native grid | per-pixel, 8-class head | `models/salsanext.py` |
 
-Why a point-based candidate at all, alongside two image-based ones: the CNN
-candidates rasterize each scan into a fixed `(64, 1024)` grid (one pixel per LiDAR
-ray). For this specific sensor that rasterization is actually lossless — see
-"Why raw points, not the range grid" below — but it still commits to 2D-image
-assumptions (translation-equivariant convolutions, a fixed grid topology) that a
-point-based method doesn't share. Comparing the two representations empirically,
-rather than assuming one is better, is the point of having three candidates instead
-of one.
+PointNet++ is the one this repo is built around and the one that deploys. The other two
+are the comparison it has to beat.
+
+> **Simulation and real data are evaluated differently, and the distinction matters.**
+> In simulation there are ground-truth labels, so reconstruction *and* classification
+> get real numbers on a held-out test split. On real data there is **no ground truth at
+> all** — a real Ouster carries no `laser_retro` — so nothing there is scored. The
+> real-world claim is qualitative, and the demo says so on the page.
+
+---
+
+## Quick start
+
+```bash
+pip install -r requirements.txt          # training machine
+python3 -m pytest tests/ -v              # synthetic fixtures, no data or GPU needed
+```
+
+To just look at the results, open `demo/index.html` in a browser. It needs no server,
+no network and no Python — see [The demo](#the-demo).
 
 ## The data
 
-A single fully-recorded Gazebo scenario: a Jackal robot driving through the "MBUT"
-tunnel corridor (~1.95 m wide, ~300 m of corridor, built from a real-world mesh
-reconstruction of that tunnel), with objects placed in it. 600 recordings, sampled
-at roughly 1.9 Hz along the drive (**not** the sensor's native rate — see
-"Point budget and real-time constraints" below).
+**76 recorded Gazebo scenarios, 7,600 scans**, of a Clearpath Jackal driving the "MBUT"
+tunnel corridor (~1.95 m wide, ~300 m long). The simulated world is built from a real
+mesh reconstruction of that corridor, which is what makes the sim-to-real comparison
+meaningful rather than a comparison against an invented room.
 
-Each recording (`x, y, z, intensity, ring` — 65,536 points, a VLP-16-labeled but
-effectively 64-ring × 1024-column organized scan) carries a per-point class label in
-`intensity`, via Gazebo's `laser_retro` mechanism:
+Split **5,320 / 1,140 / 1,140** (train/val/test) by `data_prep/split.py`, spatial-block
+so adjacent near-duplicate frames never land in different splits. Every candidate reads
+the same `data/sim/{train,val,test}_ids.npy`.
 
-| raw value | class | notes |
+Each scan is 65,536 points (`x, y, z, intensity, ring`) — a 64-ring × 1024-column
+organized scan — with a per-point class label carried in `intensity` via Gazebo's
+`laser_retro`:
+
+| raw value | class | present? |
 |---|---|---|
-| 0.0 | environment | tunnel walls/floor, **and** no-return points (see below) |
-| 1.0 | human | **zero examples in this recording** |
-| 2.0 | car | **zero examples** (this value also covers a dead "mercedes" duplicate label that never spawns) |
-| 3.0 | bus | **zero examples** |
-| 4.0 | sphere | present |
-| 5.0 | cylinder | present, the rarest of the four present classes |
-| 6.0 | box2 | present |
-| 7.0 | box1 | present |
+| 0.0 | environment | 99.10% of all points, **and** no-return points |
+| 1.0 / 2.0 / 3.0 | human / car / bus | **zero examples** |
+| 4.0 | sphere | 0.24% |
+| 5.0 | cylinder | 0.09% — the rarest present class |
+| 6.0 | box2 | 0.17% |
+| 7.0 | box1 | 0.40% |
 
-Measured across the full recording (`data_prep/parse_recordings.py`'s sanity output):
-environment is 99.10% of all points; sphere 0.24%, box1 0.40%, box2 0.17%, cylinder
-0.09%. Human/car/bus are not rare — they are **absent**. No amount of loss weighting
-or clever sampling manufactures training signal that doesn't exist; this repo's
-class head is sized for the full 8-value taxonomy (so no architecture change is
-needed if a future scenario adds them), but only the four present classes get
-evaluated honestly. Treat human/car/bus detection as untested, not as "probably
-fine."
+Human/car/bus are not rare, they are **absent**. No loss weighting manufactures signal
+that does not exist. The class head is sized for the full 8-value taxonomy so a future
+scenario needs no architecture change, but treat those three as untested, not as
+"probably fine".
 
-**Two data gotchas that will silently break things if missed:**
+**Two gotchas that silently break things:**
 
-1. **The GPU ray tracer's class labels are not exact integers.** A real sample holds
-   values like `6.98863`, not a clean `7.0`. Always `np.rint()` before comparing —
-   `dataset.py`'s `_load_raw` does this; a naive `intensity == 7.0` check would miss
-   almost every real object point.
-2. **No-return points (`inf` in x/y/z) also carry `intensity == 0.0`** — identical to
-   an environment hit. They're rare (0.02% of all points, confirmed empirically) but
-   must be filtered by checking `isfinite`, not by class value, or they poison every
-   distance computation downstream (FPS, ball query, Chamfer distance) with NaN/inf.
+1. **Class labels are not exact integers.** The GPU ray tracer yields `6.98863`, not
+   `7.0`. Always `np.rint()` before comparing — `dataset.py::_load_raw` does. A naive
+   `intensity == 7.0` misses almost every object point.
+2. **No-return points (`inf` in x/y/z) also carry `intensity == 0.0`**, identical to an
+   environment hit. Filter on `isfinite`, never on class value, or they poison every
+   distance computation downstream (FPS, ball query, Chamfer) with NaN/inf.
 
-## Why raw points, not the range grid
+### Why raw points, not the range grid
 
-`data_prep/parse_recordings.py` (built for the CNN/VAE candidates) stores a scalar
-**range** value per pixel — `sqrt(x²+y²+z²)` — not the original x/y/z. That's a
-one-way transform: recovering x/y/z from range alone needs each ray's exact 3D
-direction, which requires knowing this simulated sensor's precise per-ring vertical
-beam angle, which isn't available. So `dataset.py` in this repo reads directly from
-the **original raw recordings** (real x/y/z), not from the already-parsed range
-grids — a completely separate data path from the CNN/VAE candidates, joined only by
-sharing the same `sample_id` keys and the same train/val/test split
-(`data/sim/{train,val,test}_ids.npy`, computed once by `data_prep/split.py` and
-reused by every candidate, spatial-block split so adjacent near-duplicate frames
-never land in different splits).
+The `(64,1024)` rasterization is **not lossy for this sensor**: the `ring` field is
+already in clean ring-major order, so all 65,536 points land in 65,536 distinct cells.
+It is a lossless reindexing.
 
-One clarification worth being explicit about, since it came up directly: the
-`(64, 1024)` rasterization the CNN candidates use is **not** a lossy operation for
-*this* sensor. The recordings' `ring` field is already in clean ring-major order —
-1024 contiguous points per ring, ring 0 through ring 63, confirmed empirically before
-writing any parsing code — so every one of the 65,536 points lands in exactly one
-distinct grid cell, always. It's a lossless reindexing, not a projection that merges
-or drops points. What raw points genuinely buy over the grid is different: explicit
-3D coordinates handed to the network directly, rather than a scalar range value the
-network has to implicitly combine with its position in a fixed grid to recover
-geometry — and no commitment to convolution's fixed-topology assumption. What raw
-points *cost*, covered next, is that PointNet++'s cost doesn't scale as gracefully
-with point count as a 2D convolution does, which is why a point *budget* is a real
-constraint for this candidate specifically and not for the other two.
+What raw points buy is different: explicit 3D coordinates handed to the network, rather
+than a scalar range the network must implicitly combine with grid position to recover
+geometry — and no commitment to convolution's fixed-topology assumption. What they
+cost is that PointNet++ does not scale with point count as gracefully as a 2D
+convolution, which is why a point *budget* is a real constraint for this candidate and
+not for the other two.
 
-## Point budget and real-time constraints
+`data_prep/parse_recordings.py` stores a scalar **range** per pixel, not x/y/z. That is
+one-way (inverting it needs each ray's exact beam angle, which is not recorded), so
+`dataset.py` reads the original raw recordings instead — a separate data path from the
+range-image candidates, joined only by sharing `sample_id` keys and the split.
 
-**Deployment target: NVIDIA Jetson AGX Orin, 64GB, JetPack 5.1.x (Ubuntu 20.04,
-Python 3.8.10, CUDA 11.4.315), inference only.** Training happens entirely on a
-separate machine (Quadro RTX 5000, 16GB VRAM, 64GB system RAM, Xeon Silver 4110) —
-nothing in this repo trains on the Jetson, ever.
+## Point budget and the Jetson
 
-The full 65,536 points/scan is too many for PointNet++'s FPS + ball-query hierarchy
-to process at any useful rate on Orin (measured, see below). The fix decided on:
-**decimate the ray pattern itself** — keep every ring, keep every 2nd azimuth
-column — rather than randomly dropping points or using a generic spatial heuristic
-like voxel-grid downsampling. This is deliberate, not arbitrary: it's literally
-simulating a coarser real sensor, and applying the identical decimation to the
-Jetson's live feed at inference means there is no train/inference mismatch on "which
-points does the model even see" — a property neither random subsampling nor
-voxel-grid downsampling gives you for free.
+**Deployment target: NVIDIA Jetson AGX Orin 64GB, JetPack 5.1.x, inference only.**
+Training happens on a separate machine (Quadro RTX 5000).
 
-### Why decimate azimuth, never rings
+65,536 points/scan is too many for PointNet++'s FPS + ball-query hierarchy on Orin. The
+fix is to **decimate the ray pattern itself** — keep every ring, keep every 2nd azimuth
+column — rather than randomly dropping points or voxel-downsampling. That is literally
+simulating a coarser sensor, and applying the identical decimation to the live feed
+means no train/inference mismatch in *which points the model even sees*.
 
-Empirically checked against the real recording (not assumed) — object-class frame
-coverage at a few decimation patterns, against the full-resolution baseline
-(sphere 581/600, cylinder 410/600, box2 521/600, box1 600/600):
+### Why azimuth, never rings
+
+Measured, not assumed — object-class frame coverage at equal point counts:
 
 | decimation | points | sphere | cylinder | box2 | box1 |
 |---|---|---|---|---|---|
-| every 2nd ring, every 2nd col | 16,384 | 481/600 | 271/600 | 259/600 | 542/600 |
-| every ring, every 4th col | 16,384 | 424/600 | 222/600 | 413/600 | 550/600 |
-| **every ring, every 2nd col** | **32,768** | **528/600 (91%)** | **316/600 (77%)** | **501/600 (96%)** | **598/600 (100%)** |
+| every 2nd ring, every 2nd col | 16,384 | 481 | 271 | 259 | 542 |
+| every ring, every 4th col | 16,384 | 424 | 222 | 413 | 550 |
+| **every ring, every 2nd col** | **32,768** | **528 (91%)** | **316 (77%)** | **501 (96%)** | **598 (100%)** |
 
-Same total point count, very different results depending on *which* axis gets cut.
-Keeping full ring (vertical) resolution and only thinning azimuth clearly wins.
-Reasoning after the fact: with only 64 rings total to begin with, losing rings costs
-far more per class than losing azimuth columns (1024 total, much finer to start) —
-small objects only span a handful of rings, so any vertical decimation risks
-skipping over them entirely. This is implemented as `RING_STRIDE = 1, COL_STRIDE = 2`
-in `dataset.py`, producing exactly `64 × 512 = 32,768` points
-(`dataset.N_POINTS`).
+Same point count, very different results depending which axis gets cut. With only 64
+rings to begin with, small objects span a handful of them, so vertical decimation risks
+skipping objects entirely; azimuth starts at 1024 and is far finer. Implemented as
+`RING_STRIDE = 1, COL_STRIDE = 2` in `dataset.py` → `64 × 512 = 32,768` points.
 
-**Uniform decimation of any kind still doesn't fix class imbalance** — cylinder
-coverage drops from 410/600 to 316/600 even in the best decimation pattern tested.
-That's an honest, physical limitation of a single recording with this few object
-instances, not a sampling bug to engineer around further. A class-aware sampling
-scheme that *guarantees* every object point survives was considered and explicitly
-rejected: it would need ground-truth labels to decide what to keep, which don't
-exist at real inference time, creating exactly the train/inference mismatch this
-whole design is trying to avoid.
+Uniform decimation still does not fix class imbalance (cylinder coverage drops anyway).
+A class-aware scheme that guarantees object points survive was considered and
+**rejected**: it needs ground-truth labels to decide what to keep, which do not exist at
+inference time — exactly the mismatch this design avoids.
 
-### The actual measured cost (encoder only)
+### Measured cost on the real Orin
 
-`benchmarks/pointnet2_jetson_bench.py`, run on the real Orin (`PointNet2Encoder`,
-single-scan batches — matching real deployment: one scan in, one prediction out,
-repeatedly):
+`benchmarks/pointnet2_jetson_bench.py`, `PointNet2Encoder`, single-scan batches:
 
 | points | latency | rate | peak memory |
 |---|---|---|---|
@@ -157,367 +133,326 @@ repeatedly):
 | 16,384 | 2260 ms | 0.4 Hz | 3.5 GB |
 | 32,768 | 5378 ms | 0.2 Hz | 14.0 GB |
 
-None of these reach the LiDAR's real native rate (10 Hz, confirmed against the
-sensor driver config, not the recording's ~1.9 Hz save cadence, which is a separate
-logging choice). That turned out not to matter: the SLAM stack this robot also runs
-(KISS-Matcher + spark_fast_lio, config checked directly — `local_reg.num_threads: 8`,
-zero CUDA/GPU parameters anywhere in either the KISS-Matcher config or the
-spark_fast_lio patch) is CPU-only and needs every scan for accurate odometry
-regardless of what the classifier does — the two don't need to run at the same rate,
-since SLAM doesn't consume the classifier's output. The actual binding constraint
-turned out to be almost nothing: the robot moves slowly through this tunnel
-(measured from the recording's own trajectory: ~0.38 m/s median), so even at 32,768
-points / 0.2 Hz (5.4s between predictions), that's roughly 2m of travel between
-updates against a corridor that's ~1.95m wide and ~300m long — workable, if worth
-keeping an eye on.
+None reach the sensor's native 10 Hz. That turned out not to bind: the SLAM stack
+(KISS-Matcher + spark_fast_lio) is CPU-only, needs every scan for odometry, and does
+not consume the classifier's output — the two need not run at the same rate. The robot
+moves at ~0.38 m/s median, so 5.4 s between predictions is ~2 m of travel in a ~300 m
+corridor. Workable, worth watching.
 
-**Chosen: 32,768 points, full ring resolution, every-2nd azimuth column.** Best
-class coverage by a wide margin, and the real-time budget turned out not to force a
-smaller choice.
-
-One honest caveat: `ball_query`'s implementation changed after this benchmark was
-run (see "Testing" below — two real bugs, fixed) and the benchmark script previously
-had a separate, untested inline copy of the FPS/ball-query code rather than
-importing the real, now-fixed version. It's been refactored to benchmark
-`PointNet2Encoder` directly, so it can't drift out of sync again, but **the numbers
-above should be re-confirmed with the current code before being treated as final** —
-the fixes shouldn't meaningfully change timing (they replace one masked assignment
-with one `torch.where`, not a different algorithm), but "shouldn't" isn't the same
-as "confirmed."
+> **Caveat:** these numbers predate the `ball_query` / `farthest_point_sample` fixes
+> (see [Testing](#testing)). The fixes replace a masked assignment with a `torch.where`,
+> not a different algorithm, so timing should be unchanged — but "should" is not
+> "confirmed". Re-run before quoting as final.
 
 ## What actually deploys — only the encoder
 
-This is not a new decision specific to this repo — it's carried over from how the
-existing CNN baseline is already deployed elsewhere in this project: the decoder
-exists purely to shape the encoder during training (via the training losses,
-i.e. the Information Bottleneck idea — constrain what the latent captures, but push
-it to capture whatever's predictive of the training signal), and gets discarded
-entirely before deployment. Only `encoder.state_dict()` is ever saved or loaded for
-inference; the wrapper that consumes it downstream never even imports a decoder
-class.
+The decoders exist purely to shape the encoder during training (the Information
+Bottleneck idea: constrain what the latent captures, push it to capture what is
+predictive) and are discarded before deployment. Only `encoder.state_dict()` is ever
+loaded for inference.
 
-This repo verifies that claim rather than just asserting it —
+This is verified, not asserted:
 `tests/test_pointnet2_model.py::test_only_encoder_state_dict_is_needed_for_deployment`
-loads *only* the encoder's weights into a fresh, decoder-less `PointNet2Encoder` and
-checks it reproduces the full model's `encode()` output exactly. If that test ever
-fails, something has broken the deployment story, not just a training detail.
+loads only the encoder's weights into a fresh, decoder-less `PointNet2Encoder` and
+checks it reproduces `encode()` exactly.
 
-One consequence worth stating plainly: because nothing decoder-shaped ever runs on
-the Jetson, the decoders' internal structure — how many of them, how they're
-built — has **zero effect on the deployment point-budget/latency numbers above**.
-It only affects training cost, on the Quadro, which has headroom to spare. That's
-also why the two decoders below are free to be structured completely differently
-from each other; there's no deployment cost trade-off pushing them toward looking
-similar.
+Consequence: the decoders' structure has **zero effect on the deployment latency numbers
+above**. It only costs training time, on the Quadro, which has headroom — which is why
+the two decoders are free to be structured completely differently.
 
-### Why two decoders, and why they're structurally different
+### Why the two decoders differ structurally
 
-Both exist purely as training-time losses shaping the encoder — but they're not
-doing the same job, and were deliberately built with different structure to match:
+**`ReconstructionDecoder`** takes the latent `z` **alone** — no path back to the input.
+That is what makes reconstruction quality a real test of the bottleneck: with skip
+connections it could reconstruct well regardless of how good the latent is, making the
+metric meaningless for its purpose. Verified by
+`test_reconstruction_decoder_depends_only_on_latent_not_raw_input`. Scored with
+**Chamfer distance**, since point sets have no natural pixel-wise loss.
 
-**`ReconstructionDecoder`** takes the latent vector `z` **alone** — no connection back
-to the raw input points. This is the one that actually tests whether the bottleneck
-is informative: if reconstruction from `z` alone is close to the real input, `z`
-genuinely captured the geometry; if a decoder had shortcuts back to the raw input
-(skip connections), it could reconstruct well regardless of how good or bad the
-latent is, making the reconstruction-quality metric meaningless for its actual
-purpose. Verified directly:
-`test_reconstruction_decoder_depends_only_on_latent_not_raw_input` checks both that
-the decoder's forward signature structurally accepts nothing but `z`, and that it's
-a deterministic function of `z` (same `z` → same output, different `z` → different
-output). Scored with **Chamfer distance** (`losses.py`) against the input cloud,
-since point sets don't have a natural pixel-wise loss the way images do.
+**`SegmentationDecoder`** is the standard feature-propagation decoder *with* skip
+connections to every encoder level. Its job is not to test the bottleneck but to give
+the encoder a semantically rich training signal. A bottleneck-only decoder demonstrably
+smooths away small sparse detail — and small objects are the classification target.
+Scored with **class-weighted cross-entropy**, weights as capped inverse frequency:
+capped in both directions, because the rarest present class would otherwise get a
+destabilising weight, and the *absent* classes would divide by zero and produce `inf`.
 
-**`SegmentationDecoder`** is the standard PointNet++ feature-propagation decoder,
-*with* skip connections to every encoder level. Its job isn't to test the bottleneck
-in isolation — it's to give the encoder a strong, semantically rich training signal
-(what class does each point belong to), and skip connections are the right call
-there for the same reason they were added to the CNN candidates' segmentation heads:
-a bottleneck-only decoder demonstrably smooths away small, sparse detail (observed
-directly in the baseline CNN's early reconstructions — small object clusters were
-visibly blurred out), and small objects are literally the classification target
-here. Scored with **class-weighted cross-entropy** (`losses.py`), weights computed
-as capped inverse frequency from the actual decimated training distribution — capped
-in both directions, since (a) the rarest present class (cylinder) would otherwise get
-a destabilizingly large weight, and (b) the *absent* classes (human/car/bus, zero
-count) would otherwise produce a literal `inf` from dividing by zero, which is
-silently catastrophic the moment anything touches the full weight vector even though
-no individual training step ever selects an absent class as a target.
+## Comparing the three candidates
+
+**`kevin_pipeline/fair_comparison.py` is the only script that puts all three on one
+scale**, and its output is the only thing the demo's table may be built from.
+
+The trap it exists to avoid: the per-run `outputs/*/train_metrics.json` files are *not*
+comparable. PointNet++'s recon loss there is a **Chamfer distance in metres**, while
+SalsaNext's and the CNN's are **normalized MSE**. Tabling them side by side is wrong by
+roughly three orders of magnitude. `fair_comparison.py` reprojects PointNet++'s
+free-form output onto the real ray grid and scores it with the same normalized formula
+as the other two, on the same test ids, with the same `max_range`.
+
+```bash
+python3 kevin_pipeline/fair_comparison.py \
+    --json-out outputs/measured/fair_comparison.json
+```
+
+Per-class classification numbers come from `evaluate.py`, which also implements the
+confidence threshold described next:
+
+```bash
+python3 evaluate.py --class-conf-threshold 0.97 \
+    --checkpoint outputs/pointnet2_checkpoints/epoch39_multitask_model.pt \
+    --json-out outputs/measured/evaluate_pointnet2.json
+```
+
+### The confidence threshold is a display decision
+
+A point keeps its predicted object class only if softmax confidence clears a threshold;
+otherwise it reads as environment. **This does not change any weights** — it changes
+what gets drawn. It exists because raw argmax scatters low-confidence object
+predictions across the floor of real scans.
+
+The value was chosen by sweeping against the labelled *simulated* test set, not by eye:
+
+| threshold | 0.0 (argmax) | 0.70 | **0.97** |
+|---|---|---|---|
+| macro-F1 (object classes) | 0.681 | 0.787 | **0.867** |
+
+Cylinder precision goes from 33.6% to 78.1% across that range; above 0.97 it declines
+again. `evaluate.py --class-conf-threshold` reproduces any row of that table, and
+`ros2_inference/_shared_inference.py` applies the same rule at inference.
+
+## Sim2real: running on the real sensor
+
+Real recordings come from an **Ouster OS1-64 on a Clearpath Jackal** over ROS2, whose
+64 rings match the simulated sensor's grid directly.
+
+```bash
+# offline, over a recorded bag -- needs no ROS2 installation (uses `rosbags`)
+python3 ros2_inference/run_inference_on_bag.py \
+    --bag real_bags/bag3_20260910_152806 --topic /ouster/points
+
+# live, on the robot, inside a ROS2 environment
+ros2 run ... ros2_inference/live_inference_node.py
+```
+
+Both share `ros2_inference/_shared_inference.py`, so the offline and live paths cannot
+drift apart.
+
+### Two things measured on real data, and one removed
+
+- **Ring-dependent dropout is real and large.** Returns are lost at ~2% on the middle
+  rings, rising to ~34% at ring 63. `real_noise_augment.py` holds the measured 64-element
+  rate array and applies it to simulated scans during fine-tuning.
+- **False points are not.** An earlier noise model injected spurious near-range points
+  at 5%. Measuring the actual rate of isolated near-range spikes in the bags gave
+  **0.065%**, so the injection was removed entirely rather than kept at a smaller value.
+  It came from misreading a viridis colormap — yellow there is *far*, not near.
+- **Ring order is inverted relative to simulation.** Measured beam elevation in bag3:
+  ring 0 is `+21°` (the highest beam), ring 63 is `-17°`. The simulated convention is the
+  opposite, so the `flipud` that is correct for simulated grids makes real playback
+  upside down. The real path does not flip.
+
+### What cannot be claimed
+
+There is no ground truth on real data. Nothing in this section produces an accuracy
+number, and none should be quoted. The honest output is visual: the predicted class map
+on a real drive, at a stated threshold, next to the reconstruction.
+
+## The demo
+
+`demo/` is a self-contained, pre-rendered presentation of all of the above — the tunnel
+reconstruction, the three-candidate comparison, the per-class table, playbacks of all
+three candidates on the same simulated drive, the real-bag run, and an interactive 3D
+view of what the 256-d latent preserves.
+
+**It works three ways**, and all three are deliberate:
+
+```bash
+# 1. as a folder -- no server, no Python, no network
+open demo/index.html
+
+# 2. served
+docker compose up -d demo        # -> http://localhost:8080
+
+# 3. regenerate it from checkpoints and data
+python3 demo/build_demo.py --all
+```
+
+Nothing runs a model in the browser. Every frame is rendered offline by this repo's own
+scripts and embedded; each playback states the checkpoint it came from.
+
+The `file://` mode is what constrains the design: an opaque origin blocks `fetch()` and
+ES modules, so every payload is a **classic script** that registers itself
+(`DEMO.register(kind, id, payload)`) and three.js's `PLYLoader`/`PCDLoader` cannot be
+used — geometry is pre-quantized into base64 and decoded to typed arrays by hand.
+
+Adding a fourth candidate is a **data change**: one entry in `demo/sources.json`, one in
+`demo/metrics_template.json`, one tab in `demo/payloads/manifest.js`. No new exporter
+code.
+
+```bash
+python3 demo/build_demo.py --check     # validate; stdlib only, no torch, needs no data
+python3 demo/build_demo.py --report    # per-file sizes and budget
+python3 demo/build_demo.py --only sim_player:pointnet2_sim
+```
+
+`--check` asserts what the page cannot check for itself: that every telemetry field a
+payload declares is present in *every* frame, that referenced frames and figures exist,
+that timestamps do not go backwards, and that **no subresource loads from a remote
+origin** (fonts are self-hosted; a Google Fonts `@import` is both an offline break and a
+GDPR exposure for a German university page).
+
+Missing inputs **skip, they do not fail** — checkpoints, `scenario_data/`, the bags and
+the `.ply` geometry are all gitignored, so a fresh clone still builds the parts it has
+and keeps previously committed payloads for the rest.
+
+## Docker
+
+```bash
+docker compose up -d demo                    # nginx + pre-rendered payloads, no GPU
+docker compose --profile pipeline build      # CUDA image, only if you want to regenerate
+docker compose --profile pipeline run --rm pipeline python demo/build_demo.py --all
+```
+
+The pipeline service is **profile-gated** so `docker compose up` still works on a machine
+with no NVIDIA runtime — a GPU reservation there is a hard error, not a warning.
+Large data is bind-mounted at run time, never baked into the image; the root
+`.dockerignore` keeps a 15.9 GB bag out of the build context.
+
+nginx rather than `python -m http.server` for one concrete reason: the latter has no
+HTTP Range support, so seeking inside the videos silently fails.
+
+> **Not verified locally.** Docker is not installed on the development machine, so both
+> images are written but unbuilt. Test on a machine that has it before relying on them.
 
 ## Setup
 
-### Cloning this repo (any machine)
+### Cloning
 
-This is a **code-only** repo — `git clone`/`git pull` gets every `.py` file, the
-tests, and this README, but not the data. Deliberate: the raw scenario recordings
-alone are ~496MB, GitHub's free LFS storage is only ~1GB/repo, and this project
-will likely add more recorded scenarios over time — that adds up fast against a
-free quota. Two things need to exist locally (neither is in git):
+Code-only repo. `git clone` gets every `.py`, the tests, and the demo shell — not the
+data. Two things must exist locally, neither in git:
 
-**`scenario_data/`** (~496MB: the 600 `.npz`/`.json` recordings, the Gazebo
-world/scenario files, environment meshes, driving-map visualization) — synced by
-whatever channel works between your two machines, not via GitHub. From this dev
-machine to the Quadro, for example:
+- **`scenario_data/`** — the raw recordings. Synced by rsync/scp, not GitHub.
+- **`data/`** — parsed grids + split. Do **not** sync; regenerate:
 
 ```bash
-rsync -avzP /home/ahmed/sim2real-lidar/scenario_data/ quadro-host:/path/to/sim2real-lidar/scenario_data/
+python3 data_prep/parse_recordings.py
+python3 data_prep/split.py
 ```
 
-(swap in the Quadro's real hostname/path — this command hasn't been run, since this
-session has no network path to that machine; adjust and run it yourself, or use
-scp/a shared drive/whatever's easiest.)
+Deterministic (no RNG in either script), confirmed by regenerating and diffing.
 
-**`data/`** (parsed range/class grids + train/val/test split, ~134MB) — don't sync
-this at all, regenerate it locally on each machine instead. It's fully and
-deterministically reproducible from `scenario_data/` (no RNG anywhere in
-`data_prep/parse_recordings.py` or `split.py` — confirmed by regenerating it from
-the in-repo copy and diffing the class-count/split-size output against the original
-run: identical):
+### Training machine
 
 ```bash
-python3 data_prep/parse_recordings.py   # ~10s
-python3 data_prep/split.py              # instant
+pip install -r requirements.txt            # training only
+pip install -r requirements-pipeline.txt   # + demo rendering, video, mesh decimation
 ```
 
-### Training machine (Quadro RTX 5000 or equivalent)
+`requirements.txt` is the training minimum and is **not** enough to rebuild the demo —
+that needs `pytorch_msssim`, `rosbags`, `pillow`, `matplotlib`, `imageio-ffmpeg`,
+`fast-simplification` and `scipy`, which is what the pipeline file adds.
 
-```bash
-pip install -r requirements.txt
-```
+### Jetson AGX Orin (inference only)
 
-Standard x86_64 CUDA PyTorch install — nothing exotic. Verify with `nvidia-smi` /
-`python3 -c "import torch; print(torch.cuda.is_available())"` first.
-
-### Jetson AGX Orin (inference only — this repo never trains here)
-
-**`pip install torch` does not work on Jetson.** PyPI's wheels are built for
-x86_64; Jetson is ARM64 (aarch64) with a CUDA build tied to the exact JetPack/L4T
-version. Confirm the exact JetPack sub-version first (Ubuntu 20.04 + Python 3.8 +
-CUDA 11.4.315 narrows it to the 5.1.x family, but not the exact patch):
+**`pip install torch` does not work on Jetson.** PyPI wheels are x86_64; Jetson is
+aarch64 with a CUDA build tied to the exact JetPack/L4T version. Confirm it first:
 
 ```bash
 sudo apt-cache show nvidia-jetpack | grep -i version
-# or: cat /etc/nv_tegra_release
 ```
 
-Then get the matching PyTorch wheel from NVIDIA's official Jetson PyTorch page for
-that exact JetPack version (a generic pip/PyPI install will silently install an
-incompatible x86_64 wheel or simply fail) — and a matching `torchvision` build,
-which is not automatically compatible just because the torch version matches.
+then take the matching wheel from NVIDIA's Jetson PyTorch page, plus a matching
+`torchvision` (not automatically compatible just because torch matches).
 
-No custom CUDA extensions are used anywhere in this repo (`pointnet2_utils.py` is
-pure PyTorch — `torch.cdist`, `torch.sort`, `torch.where`, standard indexing). This
-is deliberate: compiling custom CUDA/C++ extensions against Jetson's aarch64 +
-JetPack-pinned CUDA/PyTorch build is a well-known, avoidable source of Jetson setup
-pain, and this project's data scale doesn't need the speed a compiled extension
-would buy.
+No custom CUDA extensions are used anywhere — `pointnet2_utils.py` is pure PyTorch
+(`torch.cdist`, `torch.sort`, `torch.where`). Deliberate: compiling extensions against
+Jetson's pinned CUDA is a well-known and avoidable source of setup pain.
 
-## Running the pipeline
+## Training
 
 ```bash
-# 0. scenario_data/ must already be present -- see "Cloning this repo" above,
-#    it does not come from git.
-
-# 1. Parse the raw scenario recordings into (range, class) grids for the CNN/VAE
-#    candidates, and compute the shared spatial-block train/val/test split.
-#    (--recordings-dir defaults to scenario_data/twc_scenario_6633e5c2/recordings;
-#    override it if scenario_data/ holds a differently-named scenario.)
-python3 data_prep/parse_recordings.py
-python3 data_prep/split.py
-
-# 2. Run the test suite (fast, CPU, synthetic data -- no GPU or real scenario
-#    data needed to run this).
-python3 -m pytest tests/ -v
-
-# 3. (Jetson) confirm the point-budget benchmark still holds after any code change
-python3 benchmarks/pointnet2_jetson_bench.py
-
-# 4. (Training machine) train
-python3 train.py
+python3 train.py                 # PointNet++
+python3 train_salsanext.py       # SalsaNext
 ```
 
-`train.py` wires together `dataset.py` + `losses.py` + `models/pointnet2.py` +
-`train_utils.py` (shared train/validate loop + early stopping) into one entry
-point. Only one candidate exists in this repo so far, so there's no `--model`
-flag yet — adding one is a small extension once the CNN/VAE candidates exist
-alongside this one, not a rewrite. Saves `best_encoder.pt` (the only artifact
-that ever deploys), `best_multitask_model.pt` (full model, kept for
-inspection/resuming only), and `train_metrics.json` (class counts/weights
-actually used, held-out validation numbers, and the run's arguments — for
-reproducibility) to `outputs/pointnet2/`.
+Each saves `best_encoder.pt` (the only artifact that deploys), `best_multitask_model.pt`
+(kept for inspection/resume) and `train_metrics.json` to `outputs/<candidate>/`.
 
-Verified end-to-end against real data before being called done: a tiny
-(3 train / 2 val samples, 2 epochs) run on this CPU-only dev machine trains
-without crashing, losses move in the right direction, `best_encoder.pt` loads
-cleanly into a fresh `PointNet2Encoder`. That's a **correctness** smoke test,
-not a real training run — actual training needs the Quadro, and this repo
-deliberately never attempts a real run anywhere else.
-
-`data/` is gitignored (134MB+ of derived arrays, regenerable from the raw
-recordings by step 1) — never committed, always regenerated locally.
-
-## PointNet++ background (for the thesis writeup)
-
-PointNet (the non-"++" predecessor) processes a point cloud with a single global
-step: a shared per-point MLP, then a symmetric aggregation (max-pool) over all
-points, producing one global feature vector. It's simple and permutation-invariant
-(order doesn't matter, exactly as a "cloud" of points shouldn't have an order to
-begin with), but has no notion of *local* structure — every point contributes to
-one global pool with no sense of neighborhood.
-
-PointNet++ (Qi et al., 2017) fixes this with a hierarchy of **set abstraction**
-levels, each doing three things (`models/pointnet2_utils.py::SetAbstraction`):
-
-1. **Sampling** — pick a subset of points to act as the next level's centroids.
-   This project uses farthest-point sampling (FPS,
-   `pointnet2_utils.farthest_point_sample`): iteratively pick the point farthest
-   from every point already chosen, giving good spatial coverage rather than a
-   biased or clustered subset.
-2. **Grouping** — for each centroid, find its local neighborhood: every point
-   within a fixed radius (`pointnet2_utils.ball_query`), capped at `k` neighbors.
-3. **PointNet layer** — run the same simple PointNet idea (shared MLP + max-pool),
-   but *locally*, within each neighborhood instead of globally — producing one
-   feature vector per centroid, which becomes that centroid's representation for
-   the next, coarser level.
-
-Stacking several of these (`PointNet2Encoder` uses three: 32,768 → 4,096 → 1,024 →
-256 points) builds up a genuine local-to-global hierarchy — early levels capture
-fine local shape, later levels capture broader context — closer to what a CNN's
-stack of convolutions does for images, adapted to unordered point sets.
-
-For per-point tasks (here: classification), you need the reverse direction too:
-**feature propagation** (`pointnet2_utils.FeaturePropagation`) interpolates a
-coarser level's features back onto a denser one (inverse-distance-weighted 3-nearest-
--neighbor interpolation), concatenates that with the denser level's own saved
-features from the encoder pass (the skip connection), and runs another shared MLP.
-Chaining these back down through the same hierarchy in reverse
-(`SegmentationDecoder`) recovers a prediction at every one of the original 32,768
-input points.
-
-## Visualizing the data
-
-`viz/mbut_playback.html` is a self-contained (open it directly in a browser, no
-server needed) frame-by-frame player over all 600 scans — range channel and class
-channel exactly as the model sees them, plus live telemetry (time, position,
-distance traveled) and a class legend that lights up per-frame, making the class
-imbalance from "The data" above directly visible rather than just a number: watch
-it and most frames are pure environment, with object classes flashing in for only
-a few frames at a stretch. Regenerate it after any change to `data/sim/`:
-
-```bash
-python3 viz/gen_playback.py
-```
-
-`viz/player_template.html` is the static player shell (HTML/CSS/JS); `gen_playback.py`
-renders each scan to a small downsampled, palette-compressed PNG (32-color adaptive
-palette — roughly halves the size of truecolor PNG with no visible quality loss at
-this scale) and injects the result into the template.
+Checkpointing writes on **every** new best, not on a schedule — a `pip install` during a
+long run once killed training and cost the intermediate progress.
 
 ## Testing
 
-`tests/` uses a **synthetic** fixture (`tests/conftest.py`), not the real ~400MB
-scenario recordings — deliberately, so anyone cloning this repo can run the full
-suite without that external data present. The fixture matches the real file format
-exactly (same fields, same ring-major point order, the same off-integer class-label
-noise, the same inf-for-no-return convention), so passing these tests is meaningful
-against the real data's actual quirks, not just against made-up shapes.
-
-Building this test suite caught three real bugs, not test-writing mistakes — worth
-recording here as a concrete case for why this level of testing is worth the time,
-for the thesis writeup:
-
-1. **`farthest_point_sample` was non-deterministic.** It picked a random starting
-   point every call (`torch.randint`), meaning the encoder's output for the exact
-   same input scan could differ between two consecutive calls — even in
-   `model.eval()` mode, since `eval()` only changes Dropout/BatchNorm behavior, not
-   an explicit random call elsewhere in the code. For a deployed perception system,
-   that means the robot could report a different "reading" of an unchanged static
-   scene from one frame to the next, for no reason connected to the actual scene.
-   Fixed by using a fixed starting index. Caught by
-   `test_encode_matches_forward_latent` and
-   `test_only_encoder_state_dict_is_needed_for_deployment`.
-2. **`ball_query` leaked an invalid index when a centroid had zero neighbors within
-   radius.** Not a contrived edge case — it happened on ordinary random test data.
-   The fallback logic's "if the closest sorted slot is itself the out-of-range
-   sentinel, fall back to the sentinel" was a no-op bug; the sentinel value (equal
-   to the total point count, therefore out of bounds) could flow straight into the
-   returned indices, which would corrupt or crash the very next indexing operation.
-   Fixed with a proper nearest-neighbor fallback. Caught by `test_ball_query_shape`.
-3. **`ball_query` crashed outright when there were fewer total points than
-   requested neighbors (N < k).** Slicing a sorted index array with `[:k]` when the
-   array is shorter than `k` silently returns fewer than `k` elements rather than
-   erroring immediately, which broke every downstream shape assumption several
-   lines later with a confusing error message far from the actual cause. Doesn't
-   happen on this project's real data (32,768 points, k=32 — N is never close to
-   k), but is now handled explicitly (pad with the nearest-neighbor fallback)
-   rather than left to fail by luck. Caught by
-   `test_ball_query_handles_fewer_than_k_neighbors_without_crashing`.
-4. **Every norm layer was `BatchNorm`, which requires batch size > 1 in
-   training mode** (it needs at least 2 samples to compute a channel
-   statistic) — crashed during a real training smoke test at `batch_size=1`,
-   despite that being exactly the fallback `train.py`'s own OOM error message
-   suggests when a larger batch doesn't fit in memory at 32,768 points/sample.
-   Not caught by the unit tests, which had all along tested the model at
-   `batch_size=2` — worth noting as a reason end-to-end smoke tests and unit
-   tests catch genuinely different things. Fixed by switching every norm
-   layer to `GroupNorm` (normalizes within each sample independently, no
-   cross-sample statistic needed). Caught by
-   `test_multitask_forward_with_batch_size_one`.
-
-Run with:
 ```bash
 python3 -m pytest tests/ -v
 ```
 
-## Known limitations / open items
+`tests/conftest.py` builds a **synthetic** fixture rather than using the real
+recordings, so the suite runs on any clone with no external data. The fixture matches
+the real format exactly — same fields, same ring-major order, the same off-integer class
+noise, the same inf-for-no-return convention — so passing is meaningful against the real
+data's quirks.
 
-- **Human/car/bus have zero training examples** in the only scenario recording
-  available so far. The class head is sized to support them, but nothing has ever
-  taught the network to recognize them — don't read "the model works" as covering
-  these three classes.
-- **No ground truth exists for real-world evaluation.** Real LiDAR has no
-  `laser_retro` — there's no way to score real-world segmentation accuracy
-  numerically yet. Planned mitigation (not yet implemented): qualitative visual
-  inspection of predicted class maps on real scans, and/or capturing a small number
-  of real scans with a known object at a known logged position to get at least a
-  partial labeled real set.
-- **Single-scenario data** means the spatial-block train/val/test split
-  (`data_prep/split.py`) is the only thing standing between this project and
-  training on data that's essentially one long, continuous, correlated recording.
-  More scenarios from the same Gazebo simulation pipeline are the natural next step
-  if any class turns out to need more signal than this recording can give it.
-- **Jetson benchmark numbers predate the `ball_query`/`farthest_point_sample`
-  fixes** and should be re-confirmed (see "Point budget" above).
-- **Real training memory/throughput on the Quadro is not yet measured.**
-  `train.py --batch-size 2` is a conservative default reasoned from the
-  FPS/ball-query distance-matrix sizes at 32,768 points (SA1 alone computes a
-  ~537MB `cdist` per sample), not from an observed number — this repo has
-  never run on a GPU. Expect to need to tune `--batch-size` and possibly
-  `--chamfer-target-subsample` once real usage is visible; the OOM handling
-  in `train.py` gives an actionable error rather than a bare stack trace, but
-  the actual safe batch size is still an open question.
+Building the suite caught four real bugs, worth recording as evidence that this level of
+testing pays:
+
+1. **`farthest_point_sample` was non-deterministic** — a random start index per call
+   meant the same scan could encode differently between two consecutive calls, even in
+   `eval()` mode (which only affects Dropout/BatchNorm, not an explicit RNG call). A
+   deployed robot would report a changing reading of an unchanged static scene. Fixed
+   with a fixed start index.
+2. **`ball_query` leaked an out-of-bounds index** when a centroid had zero neighbours in
+   radius — on ordinary random data, not a contrived case. The sentinel (equal to the
+   point count) flowed into the returned indices and would corrupt the next indexing op.
+3. **`ball_query` crashed when N < k**, because `[:k]` on a shorter array silently
+   returns fewer elements and broke shape assumptions several lines later.
+4. **Every norm layer was `BatchNorm`**, which needs batch > 1 in training mode — so
+   `--batch-size 1` crashed, despite being exactly what `train.py`'s own OOM message
+   suggests. Unit tests had always used `batch_size=2` and missed it; an end-to-end
+   smoke test caught it. Fixed by switching to `GroupNorm`.
+
+## Known limitations
+
+- **Human/car/bus have zero training examples.** The head supports them; nothing has
+  ever taught the network to recognise them.
+- **No real-world ground truth.** Real LiDAR has no `laser_retro`, so real-world
+  classification cannot be scored — only inspected. A small labelled real set (a known
+  object at a logged position) would be the way to change that.
+- **Jetson numbers predate the `ball_query`/FPS fixes** and should be re-confirmed.
+- **Docker images are unbuilt** — no Docker on the development machine.
+- **`noslil.ply` is a placeholder scan** for the demo's tunnel section, kept until a
+  cleaner capture exists. Replacing it is `demo/build_demo.py --only tunnel`.
+- **Thesis metadata in `demo/payloads/manifest.js` is still `TODO —`** (author,
+  university, department, supervisors).
 
 ## Project structure
 
 ```
 sim2real-lidar/
-├── data_prep/
-│   ├── parse_recordings.py   # raw recordings -> (range, class) grids [CNN/VAE candidates]
-│   └── split.py               # spatial-block train/val/test split, shared by all 3 candidates
-├── models/
-│   ├── pointnet2_utils.py     # FPS, ball query, SetAbstraction, FeaturePropagation
-│   └── pointnet2.py           # PointNet2Encoder + both decoders + PointNet2MultiTask wrapper
-├── dataset.py                  # PointCloudDataset: raw recordings -> decimated (xyz, class) pairs
-├── losses.py                   # Chamfer distance, class-weighted cross-entropy
-├── train_utils.py              # shared train/validate loop, early stopping
-├── train.py                    # training entry point
-├── benchmarks/
-│   └── pointnet2_jetson_bench.py  # real Jetson latency/memory measurement
-├── tests/                       # synthetic-fixture unit tests, no external data needed
+├── data_prep/              parse_recordings.py, split.py  (shared by all candidates)
+├── models/                 pointnet2.py, pointnet2_utils.py, salsanext.py
+├── dataset.py              raw recordings -> decimated (xyz, class)   [PointNet++]
+├── salsanext_dataset.py    range-image dataset                        [SalsaNext]
+├── losses.py               Chamfer, class-weighted CE
+├── train.py / train_salsanext.py
+├── evaluate.py             test-split metrics, --class-conf-threshold, --json-out
+├── real_noise_augment.py   measured per-ring dropout, for sim2real fine-tuning
+├── kevin_pipeline/
+│   └── fair_comparison.py  THE one script that puts all three on one scale
+├── ros2_inference/
+│   ├── _shared_inference.py    ModelRunner, shared by both paths below
+│   ├── run_inference_on_bag.py offline over a recorded bag (no ROS2 needed)
+│   └── live_inference_node.py  on-robot ROS2 node
 ├── viz/
-│   ├── gen_playback.py         # data/sim/ -> mbut_playback.html
-│   ├── player_template.html    # static player shell (HTML/CSS/JS)
-│   └── mbut_playback.html      # generated, self-contained -- open directly in a browser
-├── scenario_data/               # gitignored -- NOT in this repo, sync separately (see "Cloning")
-└── data/                        # gitignored -- regenerated locally from scenario_data/
+│   ├── playback_common.py      build_playback_payload + shared rendering
+│   └── gen_playback_{pointnet2,kevin,salsanext}.py
+├── demo/                   the presentation -- see "The demo"
+│   ├── build_demo.py       exporter CLI
+│   ├── sources.json        WHAT to export  (the "add a model" lever)
+│   ├── metrics_template.json   authored prose; numbers filled from measured JSON
+│   └── schema.py           validation, stdlib only
+├── benchmarks/             Jetson latency/memory
+├── tests/                  synthetic fixtures, no external data
+├── docker/pipeline.Dockerfile
+└── docker-compose.yml
 ```

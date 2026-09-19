@@ -167,6 +167,12 @@ def main():
                      default=REPO_ROOT / "scenario_data" / "mbut_76scenarios" / "o_robot_nav")
     ap.add_argument("--splits-dir", type=Path, default=REPO_ROOT / "data" / "sim")
     ap.add_argument("--kevin-outputs-dir", type=Path, default=REPO_ROOT / "outputs" / "kevin_cnn")
+    ap.add_argument("--json-out", type=Path,
+                     help="also write these numbers as JSON. demo/build_demo.py builds the "
+                          "comparison table from this file, so the page cannot drift from the "
+                          "script -- and, critically, cannot accidentally be filled from the "
+                          "per-run train_metrics.json files, whose PointNet++ recon loss is a "
+                          "Chamfer distance in metres rather than a normalized MSE.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -213,6 +219,26 @@ def main():
     print(f"  {'SalsaNext':12} {salsa['acc']*100:>9.2f}%")
     print("  Kevin's CNN has no classification output at all -- it was never built with one, so")
     print("  it's excluded here rather than given an invented number.")
+
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        measured = {
+            "pointnet2": {"mse": pn2["mse"], "ssim": pn2["ssim"], "pointAcc": pn2["acc"]},
+            "salsanext": {"mse": salsa["mse"], "ssim": salsa["ssim"], "pointAcc": salsa["acc"]},
+        }
+        if kevin is not None:
+            # pointAcc stays null rather than 0: this candidate has no classifier,
+            # and 0 would table as "got everything wrong".
+            measured["kevin_cnn"] = {"mse": kevin["mse"], "ssim": kevin["ssim"], "pointAcc": None}
+        args.json_out.write_text(json.dumps({
+            "script": "kevin_pipeline/fair_comparison.py",
+            "testSamples": len(test_ids),
+            "sharedMaxRange": max_range,
+            "checkpoints": {"pointnet2": str(args.pointnet2_checkpoint),
+                            "salsanext": str(args.salsanext_checkpoint)},
+            "models": measured,
+        }, indent=2), encoding="utf-8")
+        print(f"\nwrote {args.json_out}")
 
 
 if __name__ == "__main__":

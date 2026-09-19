@@ -1,0 +1,15 @@
+# Context for demo/Dockerfile. Only index.html, assets/ and payloads/ are
+# COPYed, but excluding the rest keeps the context upload small and stops a
+# stray local file from silently becoming part of a published artifact.
+
+Dockerfile
+.dockerignore
+nginx-demo.conf
+README.md
+VENDOR.md
+build_demo.py
+schema.py
+sources.json
+tests/
+__pycache__/
+*.pyc

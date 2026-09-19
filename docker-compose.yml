@@ -1,0 +1,82 @@
+# Two services with deliberately different weights.
+#
+#   docker compose up -d demo                 # the thesis demo -> localhost:8080
+#   docker compose --profile pipeline run --rm pipeline <command>
+#
+# `demo` is the default and is tiny (nginx + pre-rendered payloads). It has no
+# GPU requirement, no data mounts, and no dependency on `pipeline` -- so
+# `docker compose up` works on an examiner's laptop that has never seen an
+# NVIDIA driver.
+#
+# `pipeline` sits behind a profile precisely so that it does NOT start by
+# accident. Compose parses every service it is asked to start, and a GPU
+# reservation on a machine with no nvidia-container-toolkit is a hard error,
+# not a warning. The profile keeps that failure out of the default path.
+
+services:
+  demo:
+    build:
+      context: ./demo
+      dockerfile: Dockerfile
+    image: sim2real-lidar-demo:latest
+    container_name: sim2real-demo
+    ports:
+      - "${DEMO_PORT:-8080}:80"
+    restart: unless-stopped
+    read_only: true
+    # nginx writes its pid and scratch files; with read_only above it needs
+    # these as tmpfs rather than a writable layer. The tmpfs masks the image's
+    # pre-made /var/cache/nginx/*_temp directories, which is fine because the
+    # nginx master runs as root and recreates its configured temp paths at
+    # startup -- but if this container ever exits immediately with
+    # "mkdir() /var/cache/nginx/client_temp failed", dropping `read_only` is
+    # the one-line fix.
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+
+  pipeline:
+    profiles: ["pipeline"]
+    build:
+      context: .
+      dockerfile: docker/pipeline.Dockerfile
+      args:
+        # Override on a host with an older driver:
+        #   docker compose --profile pipeline build --build-arg TORCH_CUDA=cu121
+        TORCH_CUDA: "${TORCH_CUDA:-cu130}"
+        TORCH_VERSION: "${TORCH_VERSION:-2.13.0}"
+    image: sim2real-lidar-pipeline:latest
+    container_name: sim2real-pipeline
+    # Bind mounts, not COPY: this is the data the .dockerignore keeps OUT of
+    # the image (real_bags/ alone is ~16 GB). Read-only where the pipeline only
+    # reads, so a bad run cannot damage the recordings.
+    volumes:
+      - ./scenario_data:/workspace/scenario_data:ro
+      - ./real_bags:/workspace/real_bags:ro
+      - ./data:/workspace/data
+      - ./outputs:/workspace/outputs
+      - ./runs:/workspace/runs
+      # The point of running the pipeline: regenerated payloads land in the
+      # host's demo/payloads/, which the demo image then builds from.
+      - ./demo/payloads:/workspace/demo/payloads
+      # Tunnel source geometry, gitignored at the repo root (/*.ply) and named
+      # by demo/sources.json. Single-file bind mounts: if one of these is
+      # absent Docker silently creates a DIRECTORY in its place and the tunnel
+      # export then fails with a confusing read error -- so on a clone without
+      # the .ply files, comment these two lines out. Only `--only tunnel`
+      # needs them; every other exporter runs fine without.
+      - ./noslil.ply:/workspace/noslil.ply:ro
+      - ./2.ply:/workspace/2.ply:ro
+    shm_size: "8gb"     # DataLoader workers; the 64MB default causes silent hangs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Nothing long-running here -- it is a task runner, used with
+    # `compose run`, so there is no sensible default restart policy.
+    restart: "no"

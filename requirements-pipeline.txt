@@ -1,0 +1,31 @@
+# Everything needed to REGENERATE the demo from raw data: train, evaluate,
+# render playbacks, decimate the tunnel geometry, transcode the videos.
+#
+# This is deliberately separate from requirements.txt. That file is the
+# training-machine minimum; this one is what docker/pipeline.Dockerfile
+# installs, and running the full pipeline with only requirements.txt fails
+# partway through on a missing import -- which is how several of the entries
+# below were found.
+#
+# NOT included, on purpose:
+#   rclpy, sensor_msgs, sensor_msgs_py -- ROS2 runtime, only imported by
+#     ros2_inference/live_inference_node.py, which runs on the robot inside a
+#     ROS2 environment, not in this container. Reading a recorded bag needs
+#     `rosbags` (pure Python) and no ROS2 install at all, which is why the
+#     offline path is the one that is containerized.
+#   torch -- installed separately in docker/pipeline.Dockerfile, because the
+#     CUDA build needs a custom index URL (download.pytorch.org/whl/cu130) that
+#     cannot be expressed per-package here without pinning the whole file to
+#     that index. Listing it here would pull the CPU-only PyPI wheel instead.
+
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10                   # demo/build_demo.py: nearest-neighbour colour transfer
+pillow>=10.0                  # PNG frame writing (demo/build_demo.py png_frame_sink)
+matplotlib>=3.7               # viz/ figures, colormaps
+opencv-python-headless>=4.8   # ros2_inference/run_inference_on_bag.py video writing
+pytorch_msssim>=1.0           # losses.py SSIM term -- training fails at import without it
+rosbags>=0.9                  # reads .db3 bags with no ROS2 installation
+imageio-ffmpeg>=0.4           # bundles a static ffmpeg; avoids a system ffmpeg install
+fast-simplification>=0.1      # tunnel mesh decimation, 1.47M -> ~200k faces
+pytest>=7.0

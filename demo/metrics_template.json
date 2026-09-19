@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "The AUTHORED half of the comparison section: names, families, prose, and",
+    "which columns the table shows. Every actual number is left null and filled",
+    "by demo/build_demo.py from the JSON that the measuring scripts write:",
+    "",
+    "  python kevin_pipeline/fair_comparison.py --json-out outputs/measured/fair_comparison.json",
+    "  python evaluate.py --class-conf-threshold 0.97 \\",
+    "      --checkpoint outputs/pointnet2_checkpoints/epoch39_multitask_model.pt \\",
+    "      --json-out outputs/measured/evaluate_pointnet2.json",
+    "  python demo/build_demo.py --only metrics",
+    "",
+    "The split exists so that a number on the page can never be something a",
+    "human typed. Prose is written; numbers are measured. If the measured files",
+    "are absent the exporter skips and the previously generated payloads/",
+    "metrics.js is kept, so a fresh clone still renders.",
+    "",
+    "The MSE values come from fair_comparison.py, which puts all three",
+    "candidates on ONE shared scale. Do not substitute the per-run",
+    "train_metrics.json numbers: PointNet++'s recon loss there is a Chamfer",
+    "distance in metres while SalsaNext's and Kevin's are normalized MSE. Those",
+    "differ by roughly three orders of magnitude and are not comparable."
+  ],
+
+  "schemaVersion": 1,
+
+  "provenance": {
+    "split": { "train": 5320, "val": 1140, "test": 1140 },
+    "scenarios": 76,
+    "scans": 7600,
+    "grid": [64, 1024],
+    "classConfThreshold": 0.97
+  },
+
+  "models": [
+    {
+      "id": "pointnet2",
+      "name": "PointNet++",
+      "family": "Point-based encoder",
+      "winner": true,
+      "hasClassifier": true,
+      "latentDim": 256,
+      "notes": "Consumes 32,768 raw xyz points and emits 2,048 free-form points. Its reconstruction is reprojected onto the real ray grid before scoring, so this MSE survives an extra approximation step the other two don't need — the gap is, if anything, understated.",
+      "playerId": "pointnet2_sim"
+    },
+    {
+      "id": "kevin_cnn",
+      "name": "CNN autoencoder",
+      "family": "Range-image CNN",
+      "hasClassifier": false,
+      "latentDim": 256,
+      "notes": "Reconstruction only — it was never built with a classification head, so it is excluded from the accuracy comparison rather than given an invented number.",
+      "playerId": "kevin_sim"
+    },
+    {
+      "id": "salsanext",
+      "name": "SalsaNext",
+      "family": "Range-image CNN",
+      "hasClassifier": true,
+      "latentDim": 256,
+      "notes": "Outputs on the native (64,1024) grid, so no reprojection is needed. An early version scored 0.0118 MSE until an AdaptiveAvgPool2d before the latent projection was found to be discarding the positional information only the reconstruction decoder needed — fixing that improved reconstruction 9.2x.",
+      "playerId": "salsanext_sim"
+    }
+  ],
+
+  "comparison": {
+    "_comment": [
+      "No bar on SSIM deliberately: all three land in 0.952-0.972, so a",
+      "zero-based bar reads as three identical full bars, and a zoomed axis",
+      "would dramatise a difference that is genuinely small. The number alone",
+      "is the honest presentation; MSE is where the real spread is."
+    ],
+    "columns": [
+      { "key": "metrics.mse", "label": "Test MSE (normalized)", "format": "fixed6",
+        "lowerIsBetter": true, "chart": "bar" },
+      { "key": "metrics.ssim", "label": "SSIM", "format": "fixed4",
+        "lowerIsBetter": false },
+      { "key": "metrics.pointAcc", "label": "Per-point class accuracy", "format": "percent2",
+        "lowerIsBetter": false, "nullText": "no classifier" }
+    ]
+  },
+
+  "perClass": {
+    "_comment": "model + threshold are authored; macroF1 and rows come from evaluate.py --json-out.",
+    "model": "pointnet2",
+    "fromEvaluateJson": true
+  }
+}
