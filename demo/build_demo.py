@@ -248,6 +248,302 @@ def export_bag_player(cfg: dict) -> str:
     return f"{cfg['id']}: {stats['n_frames']} frames -> {out.relative_to(DEMO_DIR)}"
 
 
+def read_ply(path: Path) -> dict:
+    """Minimal binary-little-endian PLY reader.
+
+    Both assets are `binary_little_endian 1.0` from CloudCompare and Blender,
+    so a header-driven numpy structured read covers them without adding a
+    parser dependency. Returns {"vertex": structured array, "face": (F,3) int
+    or None}. Raises on ascii or big-endian, which nothing here produces.
+    """
+    import numpy as np
+
+    with open(path, "rb") as f:
+        raw = f.read()
+    end = raw.index(b"end_header\n") + len(b"end_header\n")
+    header = raw[:end].decode("latin1")
+    if "binary_little_endian" not in header:
+        raise Skip(f"{path.name}: only binary_little_endian PLY is supported")
+
+    np_of = {"float": "<f4", "float32": "<f4", "double": "<f8", "uchar": "u1",
+             "uint8": "u1", "char": "i1", "int8": "i1", "short": "<i2",
+             "ushort": "<u2", "int": "<i4", "int32": "<i4", "uint": "<u4",
+             "uint32": "<u4"}
+
+    elements, current = [], None
+    for line in header.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "element":
+            current = {"name": parts[1], "count": int(parts[2]), "props": [], "list": None}
+            elements.append(current)
+        elif parts[0] == "property" and current is not None:
+            if parts[1] == "list":
+                current["list"] = (np_of[parts[2]], np_of[parts[3]], parts[4])
+            else:
+                current["props"].append((parts[2], np_of[parts[1]]))
+
+    out, off = {}, end
+    for elem in elements:
+        if elem["list"] is None:
+            dt = np.dtype(elem["props"])
+            arr = np.frombuffer(raw, dtype=dt, count=elem["count"], offset=off)
+            off += dt.itemsize * elem["count"]
+            out[elem["name"]] = arr
+        else:
+            idx, off = _read_face_list(raw, off, elem)
+            out[elem["name"]] = idx
+    return out
+
+
+def _read_face_list(raw, off, elem):
+    """Read a variable-length face list and fan-triangulate to (F,3).
+
+    Faces genuinely vary in length here: 2.ply is a Blender export whose very
+    first face is a quad, and assuming a uniform record size from it asked for
+    24.9 MB out of a 19.06 MB block. Record size depends on each face's own
+    count, so finding the offsets is inherently sequential -- but that is one
+    cheap pass, after which each distinct face length is gathered in bulk.
+    """
+    import numpy as np
+
+    cnt_dt, idx_dt, _ = elem["list"]
+    cnt_size = np.dtype(cnt_dt).itemsize
+    idx_size = np.dtype(idx_dt).itemsize
+    n_faces = elem["count"]
+
+    counts = np.empty(n_faces, dtype=np.int64)
+    starts = np.empty(n_faces, dtype=np.int64)
+    pos = off
+    for i in range(n_faces):
+        c = int.from_bytes(raw[pos:pos + cnt_size], "little")
+        counts[i] = c
+        starts[i] = pos + cnt_size
+        pos += cnt_size + idx_size * c
+    end_off = pos
+
+    all_bytes = np.frombuffer(raw, dtype=np.uint8)
+    tris = []
+    for c in np.unique(counts):
+        c = int(c)
+        if c < 3:
+            continue  # degenerate; nothing to draw
+        sel = np.flatnonzero(counts == c)
+        byte_idx = starts[sel][:, None] + np.arange(idx_size * c)[None, :]
+        block = np.ascontiguousarray(all_bytes[byte_idx])
+        idx = block.reshape(-1).view(idx_dt).reshape(len(sel), c).astype(np.int64)
+        # fan-triangulate: (v0, vi, vi+1). Correct for the convex quads a
+        # Blender export produces; a concave n-gon would need real
+        # triangulation, which nothing here emits.
+        for k in range(1, c - 1):
+            tris.append(idx[:, [0, k, k + 1]])
+
+    faces = np.concatenate(tris, axis=0) if tris else np.zeros((0, 3), dtype=np.int64)
+    return faces, end_off
+
+
+def _quantize(positions, decimals_unused=None):
+    """float32 xyz -> int16 plus a per-axis scale/offset.
+
+    Halves the payload against float32 and, at 16 bits across a ~300 m span,
+    quantization error is ~5 mm -- far below anything visible in a point cloud
+    rendered at a few pixels per point.
+    """
+    import numpy as np
+    lo = positions.min(axis=0)
+    hi = positions.max(axis=0)
+    span = np.maximum(hi - lo, 1e-6)
+    scale = span / 65534.0
+    q = np.round((positions - lo) / scale).astype(np.int32) - 32767
+    return (np.clip(q, -32767, 32767).astype("<i2"),
+            [float(v) for v in scale], [float(v) for v in lo])
+
+
+def _b64(arr) -> str:
+    return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+def export_tunnel(cfg: dict) -> str:
+    """The opening act: the SLAM point cloud of the corridor and the
+    reconstructed mesh, both as base64 typed arrays.
+
+    Not loaded with three.js's PLYLoader -- that uses fetch/XHR, which is
+    blocked on file://, the delivery mode this demo has to support. The
+    conversion happens here instead and the viewer decodes typed arrays.
+
+    The two assets are NOT in a shared coordinate frame (cloud spans
+    316x100x18.7 m, mesh 128x68x4.2 m, and the mesh's Y extends ~10 m past the
+    cloud's), so the viewer cuts between them rather than morphing -- each is
+    framed from its own bounding box. Do not "fix" this by scaling one onto
+    the other without checking they are actually the same capture.
+    """
+    import numpy as np
+
+    pc_path = need((REPO_ROOT / cfg["pointcloud"]).resolve(), "tunnel point cloud")
+    mesh_path = need((REPO_ROOT / cfg["mesh"]).resolve(), "tunnel mesh")
+
+    # ---- point cloud -----------------------------------------------------
+    pc = read_ply(pc_path)["vertex"]
+    pts = np.stack([pc["x"], pc["y"], pc["z"]], axis=-1).astype(np.float32)
+    finite = np.isfinite(pts).all(axis=1)
+    pts = pts[finite]
+
+    intensity = None
+    for name in ("scalar_intensity", "intensity", "scalar_Intensity"):
+        if name in pc.dtype.names:
+            intensity = np.asarray(pc[name], dtype=np.float32)[finite]
+            break
+
+    max_points = cfg.get("maxPoints", 400000)
+    if len(pts) > max_points:
+        sel = np.linspace(0, len(pts) - 1, max_points).astype(np.int64)
+        pts = pts[sel]
+        if intensity is not None:
+            intensity = intensity[sel]
+
+    qp, p_scale, p_offset = _quantize(pts)
+    cloud = {"count": int(len(pts)), "positions": _b64(qp),
+             "scale": p_scale, "offset": p_offset,
+             "bounds": {"min": pts.min(axis=0).tolist(), "max": pts.max(axis=0).tolist()},
+             "center": pts.mean(axis=0).tolist()}
+    if intensity is not None and np.isfinite(intensity).any():
+        lo, hi = np.nanpercentile(intensity, [2, 98])
+        norm = np.clip((intensity - lo) / max(hi - lo, 1e-6), 0, 1)
+        cloud["intensity"] = _b64((norm * 255).astype(np.uint8))
+
+    # ---- mesh ------------------------------------------------------------
+    m = read_ply(mesh_path)
+    mv, mf = m["vertex"], m["face"]
+    verts = np.stack([mv["x"], mv["y"], mv["z"]], axis=-1).astype(np.float32)
+    faces = np.asarray(mf, dtype=np.int32)
+
+    colors = None
+    if all(c in mv.dtype.names for c in ("red", "green", "blue")):
+        colors = np.stack([mv["red"], mv["green"], mv["blue"]], axis=-1).astype(np.uint8)
+
+    max_faces = cfg.get("maxFaces", 200000)
+    if len(faces) > max_faces:
+        import fast_simplification
+        keep = max_faces / len(faces)
+        # simplify() returns a remapped vertex set, so per-vertex colours have
+        # to be carried across by nearest original vertex rather than reindexed.
+        new_v, new_f = fast_simplification.simplify(verts, faces, 1.0 - keep)
+        colors = _resample_colors(verts, colors, new_v) if colors is not None else None
+        verts, faces = new_v.astype(np.float32), new_f.astype(np.int32)
+
+    qv, m_scale, m_offset = _quantize(verts)
+    mesh = {"vertexCount": int(len(verts)), "faceCount": int(len(faces)),
+            "positions": _b64(qv), "scale": m_scale, "offset": m_offset,
+            "indices": _b64(faces.astype("<u4").ravel()),
+            "bounds": {"min": verts.min(axis=0).tolist(), "max": verts.max(axis=0).tolist()},
+            "center": verts.mean(axis=0).tolist()}
+    if colors is not None:
+        mesh["colors"] = _b64(colors.astype(np.uint8).ravel())
+
+    payload = {
+        "schemaVersion": 1, "id": cfg["id"],
+        "title": cfg.get("title", "Tunnel reconstruction"),
+        "cloud": cloud, "mesh": mesh,
+        "source": {
+            "pointcloudFile": pc_path.name, "meshFile": mesh_path.name,
+            "method": cfg.get("method", "Poisson surface reconstruction (CloudCompare)"),
+            "sharedFrame": False,
+        },
+    }
+    out = write_payload(f"tunnel/{cfg['id']}.js", "tunnel", cfg["id"], payload)
+    return (f"{cfg['id']}: cloud {cloud['count']:,} pts, mesh {mesh['faceCount']:,} faces "
+            f"-> {out.stat().st_size/1e6:.1f} MB")
+
+
+def _resample_colors(old_v, old_c, new_v):
+    """Nearest-original-vertex colour lookup after decimation.
+
+    Decimation produces a new vertex set with no index correspondence to the
+    original, so colours can't simply be reindexed. A KD-tree if scipy is
+    around, otherwise a chunked brute-force search -- this runs once at build
+    time, so the slow path is acceptable and avoids a hard dependency.
+    """
+    import numpy as np
+    try:
+        from scipy.spatial import cKDTree
+        _, idx = cKDTree(old_v).query(new_v, k=1)
+        return old_c[idx]
+    except ImportError:
+        out = np.empty((len(new_v), old_c.shape[1]), dtype=old_c.dtype)
+        for start in range(0, len(new_v), 4096):
+            chunk = new_v[start:start + 4096]
+            d = ((chunk[:, None, :] - old_v[None, :, :]) ** 2).sum(-1)
+            out[start:start + 4096] = old_c[d.argmin(axis=1)]
+        return out
+
+
+def export_pointcloud(cfg: dict) -> str:
+    """Per-scan 3D point clouds: the real scan coloured by class, plus the
+    latent-only reconstruction, for four hand-picked samples (one per object
+    class, each the test-split scan containing the most points of it).
+
+    Reads outputs/pointnet2/viz_data.json, which nothing else in the repo
+    referenced. Reshapes it from nested [x,y,z] triples into flat Float32-ready
+    arrays -- that is what THREE.BufferAttribute wants, and it avoids
+    allocating ~500k short-lived JS arrays on load. 2.2 MB becomes ~0.5 MB.
+    """
+    import numpy as np
+
+    src = need(REPO_ROOT / "outputs" / "pointnet2" / "viz_data.json",
+               "outputs/pointnet2/viz_data.json")
+    with open(src) as f:
+        raw = json.load(f)
+
+    name_to_id = {"sphere": 4, "cylinder": 5, "box2": 6, "box1": 7}
+    decimals = cfg.get("decimals", 3)
+    samples = []
+
+    for entry in raw:
+        env = np.asarray(entry["env"], dtype=np.float32)
+        pos_parts, cls_parts = [env], [np.zeros(len(env), dtype=np.uint8)]
+        counts = {0: int(len(env))}
+        for name, pts in entry["objects"].items():
+            arr = np.asarray(pts, dtype=np.float32)
+            if not len(arr):
+                continue
+            cid = name_to_id[name]
+            pos_parts.append(arr)
+            cls_parts.append(np.full(len(arr), cid, dtype=np.uint8))
+            counts[cid] = int(len(arr))
+
+        pos = np.concatenate(pos_parts, axis=0)
+        cls = np.concatenate(cls_parts, axis=0)
+        recon = np.asarray(entry["recon"], dtype=np.float32)
+        allpts = np.concatenate([pos, recon], axis=0)
+
+        samples.append({
+            "sampleId": entry["sample_id"],
+            "highlightName": entry["highlight"],
+            "highlightClass": name_to_id[entry["highlight"]],
+            "center": [round(float(v), decimals) for v in allpts.mean(axis=0)],
+            "bounds": {"min": [round(float(v), decimals) for v in allpts.min(axis=0)],
+                       "max": [round(float(v), decimals) for v in allpts.max(axis=0)]},
+            "input": {"count": int(len(pos)),
+                      "positions": [round(float(v), decimals) for v in pos.ravel()],
+                      "classIds": cls.tolist()},
+            "recon": {"count": int(len(recon)),
+                      "positions": [round(float(v), decimals) for v in recon.ravel()]},
+            "classCounts": counts,
+        })
+
+    payload = {
+        "schemaVersion": 1, "id": cfg["id"],
+        "checkpoint": Path(cfg.get("checkpoint", "")).name,
+        "note": ("Reconstruction is latent-only: ReconstructionDecoder(z) with no skip "
+                 "connections, so it is a real test of what the 256-d bottleneck retains."),
+        "samples": samples,
+    }
+    out = write_payload(f"pointclouds/{cfg['id']}.js", "pointcloud", cfg["id"], payload)
+    return (f"{cfg['id']}: {len(samples)} samples -> "
+            f"{out.stat().st_size/1e6:.2f} MB (from {src.stat().st_size/1e6:.1f} MB)")
+
+
 def export_media(cfg: dict) -> str:
     """Transcode a rendered .mp4 into something a browser can actually play,
     and grab a poster frame.
@@ -362,6 +658,8 @@ EXPORTERS = {
     "bag_player": ("bagPlayers", export_bag_player),
     "media": ("media", export_media),
     "gallery": ("gallery", export_gallery),
+    "tunnel": ("tunnel", export_tunnel),
+    "pointcloud": ("pointclouds", export_pointcloud),
 }
 
 

@@ -97,10 +97,18 @@
   ],
 
   "tunnel": {
+    "_comment": [
+      "Both paths are relative to the REPO ROOT and both files are gitignored",
+      "(/*.ply), so they live beside the code without bloating the repo.",
+      "Replacing either one and re-running `--only tunnel` is the whole update",
+      "procedure: noslil.ply in particular is a stand-in until a cleaner scan",
+      "is captured."
+    ],
     "id": "tunnel",
-    "pointcloud": "../../noslil.ply",
+    "pointcloud": "noslil.ply",
     "mesh": "2.ply",
     "maxPoints": 400000,
-    "maxFaces": 200000
+    "maxFaces": 200000,
+    "method": "Poisson surface reconstruction (CloudCompare)"
   }
 }

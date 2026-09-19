@@ -14,6 +14,7 @@
   <link rel="stylesheet" href="assets/css/fonts.css">
   <link rel="stylesheet" href="assets/css/base.css">
   <link rel="stylesheet" href="assets/css/player.css">
+  <link rel="stylesheet" href="assets/css/viewer.css">
 </head>
 <body>
   <a class="skip-link" href="#content">Skip to content</a>
@@ -42,9 +43,15 @@
   <script src="assets/js/telemetry.js"></script>
   <script src="assets/js/charts.js"></script>
   <script src="assets/js/player.js"></script>
-  <!-- three.js + the 3D viewers are added in milestone B0/B1; sections.js
-       already dispatches "tunnel" and "pointcloud" types, so turning them on
-       is adding these scripts back plus the manifest entries. -->
+
+  <!-- three.js r147: the last release shipping BOTH a UMD build and a
+       non-module OrbitControls. r148+ is ESM-only, which file:// blocks.
+       See demo/VENDOR.md before changing this. -->
+  <script src="assets/vendor/three/three.min.js"></script>
+  <script src="assets/vendor/three/OrbitControls.js"></script>
+  <script src="assets/js/tunnel.js"></script>
+  <script src="assets/js/viewer3d.js"></script>
+
   <script src="assets/js/sections.js"></script>
   <script src="assets/js/app.js"></script>
 </body>

@@ -46,6 +46,16 @@ DEMO.register("manifest", "main", {
     },
 
     {
+      "id": "tunnel",
+      "type": "tunnel",
+      "nav": "The tunnel",
+      "title": "Where this happens",
+      "blurb": "<p>The environment is a real underground corridor, surveyed with the same LiDAR that later runs the perception models. A SLAM point cloud of the drive was reconstructed into a watertight surface, and that mesh became the simulated world the encoders were trained in — which is what makes a sim-to-real comparison meaningful rather than a comparison against an invented room.</p><p>Both stages below are pre-computed. The surface reconstruction is a CloudCompare result, replayed here as a visualisation, not recomputed in your browser.</p>",
+      "payloadId": "tunnel",
+      "src": "tunnel/tunnel.js"
+    },
+
+    {
       "id": "problem",
       "type": "prose",
       "nav": "Problem",
@@ -101,6 +111,16 @@ DEMO.register("manifest", "main", {
           "src": "players/bag3_pointnet2.js"
         }
       ]
+    },
+
+    {
+      "id": "cloud3d",
+      "type": "pointcloud",
+      "nav": "3D viewer",
+      "title": "What the 256-d latent actually keeps",
+      "blurb": "<p>The reconstruction decoder sees the latent vector and nothing else — no skip connections back to the input. So the red points here are decoded from 256 numbers alone, and how closely they trace the corridor walls and the object is a direct, visual read of what survived the bottleneck.</p><p>Drag to orbit, scroll to zoom. Four test-split scans, one per object class — each the scan containing the most points of that class.</p>",
+      "payloadId": "pointnet2_recon",
+      "src": "pointclouds/pointnet2_recon.js"
     }
   ]
 });

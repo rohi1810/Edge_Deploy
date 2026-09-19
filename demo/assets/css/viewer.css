@@ -1,0 +1,91 @@
+/* 3D viewer chrome: canvas, stage bar, control panel. Shares the card
+   vocabulary from base.css so a viewer and a player look like siblings. */
+
+.viewer { padding: 0; overflow: hidden; }
+
+.viewer-canvas {
+  width: 100%;
+  line-height: 0;
+  background: var(--surface-2);
+}
+.viewer-canvas canvas { display: block; width: 100%; height: auto; }
+
+.viewer-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.stage-info { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 2px; }
+.stage-label { font-size: 0.86rem; font-weight: 600; }
+.stage-note { font-size: 0.75rem; color: var(--text-dim); }
+
+.stage-dots { display: flex; gap: 7px; }
+.stage-dot {
+  width: 9px; height: 9px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--track);
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s, transform 0.2s;
+}
+.stage-dot:hover { border-color: var(--accent); }
+.stage-dot[aria-current="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  transform: scale(1.25);
+}
+
+.viewer-btn {
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 13px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.viewer-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* control panel used by the scan-level 3D viewer (B1) */
+.viewer-layout { display: grid; grid-template-columns: minmax(0,1fr) 230px; gap: 14px; }
+@media (max-width: 860px) { .viewer-layout { grid-template-columns: 1fr; } }
+
+.viewer-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--pad-card);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  align-self: start;
+}
+.viewer-panel h3 {
+  font-size: 0.68rem; font-weight: 600; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--text-dim); margin: 0 0 8px;
+}
+.viewer-toggle {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 0.82rem; padding: 4px 0; cursor: pointer;
+}
+.viewer-toggle input { accent-color: var(--accent); cursor: pointer; }
+.viewer-sample {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  font: inherit; font-size: 0.82rem; text-align: left;
+  color: var(--text-dim); background: var(--surface); cursor: pointer;
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 7px 10px; margin-bottom: 6px;
+  transition: border-color 0.15s, color 0.15s;
+}
+.viewer-sample:hover { color: var(--text); }
+.viewer-sample[aria-current="true"] {
+  border-color: var(--accent); color: var(--accent); background: var(--accent-soft);
+}
+.viewer-slider { width: 100%; }
