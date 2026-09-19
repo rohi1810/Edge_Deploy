@@ -10,7 +10,6 @@
     "real bags are all gitignored, so a fresh clone can still build the parts",
     "it has."
   ],
-
   "simPlayers": [
     {
       "id": "pointnet2_sim",
@@ -24,10 +23,22 @@
       "upscale": 1,
       "frameMode": "files",
       "rows": [
-        { "label": "Original range", "channel": "range" },
-        { "label": "Reconstructed range (reprojected)", "channel": "range" },
-        { "label": "Original class (ground truth)", "channel": "class" },
-        { "label": "Predicted class", "channel": "class" }
+        {
+          "label": "Original range",
+          "channel": "range"
+        },
+        {
+          "label": "Reconstructed range (reprojected)",
+          "channel": "range"
+        },
+        {
+          "label": "Original class (ground truth)",
+          "channel": "class"
+        },
+        {
+          "label": "Predicted class",
+          "channel": "class"
+        }
       ],
       "legendCaption": "Objects in this frame (ground truth)"
     },
@@ -43,14 +54,53 @@
       "upscale": 1,
       "frameMode": "files",
       "rows": [
-        { "label": "Original range", "channel": "range" },
-        { "label": "Reconstructed range (native, no reprojection)", "channel": "range" },
-        { "label": "Original class (no classifier in this candidate)", "channel": "class" }
+        {
+          "label": "Original range",
+          "channel": "range"
+        },
+        {
+          "label": "Reconstructed range (native, no reprojection)",
+          "channel": "range"
+        },
+        {
+          "label": "Original class (no classifier in this candidate)",
+          "channel": "class"
+        }
       ],
       "legendCaption": "Objects in this frame (ground truth — not predicted)"
+    },
+    {
+      "id": "salsanext_sim",
+      "title": "SalsaNext on the same drive",
+      "subtitle": "native-grid reconstruction and per-pixel classification",
+      "model": "salsanext",
+      "renderer": "gen_playback_salsanext:render_salsanext_frame",
+      "checkpoint": "outputs/salsanext/best_multitask_model.pt",
+      "scenarioId": "122e86f0-8b3f-46f5-8eaa-9f6b1232c7df",
+      "maxFrames": 160,
+      "upscale": 1,
+      "frameMode": "files",
+      "rows": [
+        {
+          "label": "Original range",
+          "channel": "range"
+        },
+        {
+          "label": "Reconstructed range (native grid)",
+          "channel": "range"
+        },
+        {
+          "label": "Original class (ground truth)",
+          "channel": "class"
+        },
+        {
+          "label": "Predicted class",
+          "channel": "class"
+        }
+      ],
+      "legendCaption": "Objects in this frame (ground truth)"
     }
   ],
-
   "bagPlayers": [
     {
       "id": "bag3_pointnet2",
@@ -65,14 +115,22 @@
       "classThreshold": 0.97,
       "frameMode": "files",
       "rows": [
-        { "label": "Original range (real, measured)", "channel": "range" },
-        { "label": "Reconstructed range", "channel": "range" },
-        { "label": "Predicted class", "channel": "class" }
+        {
+          "label": "Original range (real, measured)",
+          "channel": "range"
+        },
+        {
+          "label": "Reconstructed range",
+          "channel": "range"
+        },
+        {
+          "label": "Predicted class",
+          "channel": "class"
+        }
       ],
       "legendCaption": "Predicted objects (no ground truth on real data)"
     }
   ],
-
   "media": [
     {
       "id": "bag3_pointnet2",
@@ -82,11 +140,12 @@
       "posterAt": 4.0
     }
   ],
-
   "gallery": {
-    "from": ["outputs/pointnet2/range_heatmaps", "outputs/pointnet2/recon_viz"]
+    "from": [
+      "outputs/pointnet2/range_heatmaps",
+      "outputs/pointnet2/recon_viz"
+    ]
   },
-
   "pointclouds": [
     {
       "id": "pointnet2_recon",
@@ -95,7 +154,6 @@
       "decimals": 3
     }
   ],
-
   "tunnel": {
     "_comment": [
       "Both paths are relative to the REPO ROOT and both files are gitignored",

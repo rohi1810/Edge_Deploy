@@ -82,12 +82,30 @@ DEMO.register("manifest", "main", {
 
     {
       "id": "sim_playback",
-      "type": "player",
+      "type": "tabs",
       "nav": "Simulated drive",
       "title": "Watching it run, frame by frame",
-      "blurb": "<p>A single held-out drive through the simulated corridor, played at the recording's real rate. The top two rows are the measured range image and the encoder's reconstruction of it; the bottom two are the ground-truth semantic labels and the model's predictions. Every frame states which split it belongs to, so you can see it behaving the same on data it never trained on.</p>",
-      "payloadId": "pointnet2_sim",
-      "src": "players/pointnet2_sim.js"
+      "blurb": "<p>One held-out drive through the simulated corridor, played at the recording's real rate — and the <em>same</em> drive through all three candidates, so the tabs are a like-for-like comparison rather than three different scenes. The top two rows are the measured range image and the encoder's reconstruction of it; where a candidate has a classifier, the bottom two rows are the ground-truth semantic labels and its predictions. Every frame states which split it belongs to, so you can watch it behave the same on data it never trained on.</p><p>Note the row counts differ: the CNN autoencoder has no classification head at all, so it has nothing to put in a prediction row. That is the candidate's actual capability, not a gap in the recording.</p>",
+      "tabs": [
+        {
+          "label": "PointNet++",
+          "type": "player",
+          "payloadId": "pointnet2_sim",
+          "src": "players/pointnet2_sim.js"
+        },
+        {
+          "label": "CNN autoencoder",
+          "type": "player",
+          "payloadId": "kevin_sim",
+          "src": "players/kevin_sim.js"
+        },
+        {
+          "label": "SalsaNext",
+          "type": "player",
+          "payloadId": "salsanext_sim",
+          "src": "players/salsanext_sim.js"
+        }
+      ]
     },
 
     {
@@ -121,6 +139,48 @@ DEMO.register("manifest", "main", {
       "blurb": "<p>The reconstruction decoder sees the latent vector and nothing else — no skip connections back to the input. So the red points here are decoded from 256 numbers alone, and how closely they trace the corridor walls and the object is a direct, visual read of what survived the bottleneck.</p><p>Drag to orbit, scroll to zoom. Four test-split scans, one per object class — each the scan containing the most points of that class.</p>",
       "payloadId": "pointnet2_recon",
       "src": "pointclouds/pointnet2_recon.js"
+    },
+
+    {
+      "id": "figures",
+      "type": "gallery",
+      "nav": "Per-object figures",
+      "title": "One scan per object, examined closely",
+      "blurb": "<p>The same four test-split scans as the 3D viewer, as static figures. The left pane is the raw range image — the 64×1024 grid the sensor actually produces, with the object visible as a coherent blob against the corridor walls. The right pane is the reconstruction overlay used throughout the evaluation.</p><p>These are the figures behind the per-class table above: each one is the held-out scan containing the most points of its class.</p>",
+      "items": [
+        {
+          "classId": 4,
+          "caption": "Sphere · scan 2026_08_25_17_18_39_769 · test split",
+          "panes": [
+            { "label": "Range image (measured)", "src": "gallery/range_heatmaps/2026_08_25_17_18_39_769_sphere.png" },
+            { "label": "Reconstruction overlay", "src": "gallery/recon_viz/2026_08_25_17_18_39_769_sphere.png" }
+          ]
+        },
+        {
+          "classId": 5,
+          "caption": "Cylinder · scan 2026_08_25_17_18_33_379 · test split",
+          "panes": [
+            { "label": "Range image (measured)", "src": "gallery/range_heatmaps/2026_08_25_17_18_33_379_cylinder.png" },
+            { "label": "Reconstruction overlay", "src": "gallery/recon_viz/2026_08_25_17_18_33_379_cylinder.png" }
+          ]
+        },
+        {
+          "classId": 6,
+          "caption": "Box 2 · scan 2026_08_25_17_17_58_789 · test split",
+          "panes": [
+            { "label": "Range image (measured)", "src": "gallery/range_heatmaps/2026_08_25_17_17_58_789_box2.png" },
+            { "label": "Reconstruction overlay", "src": "gallery/recon_viz/2026_08_25_17_17_58_789_box2.png" }
+          ]
+        },
+        {
+          "classId": 7,
+          "caption": "Box 1 · scan 2026_08_25_17_18_24_572 · test split",
+          "panes": [
+            { "label": "Range image (measured)", "src": "gallery/range_heatmaps/2026_08_25_17_18_24_572_box1.png" },
+            { "label": "Reconstruction overlay", "src": "gallery/recon_viz/2026_08_25_17_18_24_572_box1.png" }
+          ]
+        }
+      ]
     }
   ]
 });

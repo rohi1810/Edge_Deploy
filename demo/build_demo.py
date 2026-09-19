@@ -155,12 +155,40 @@ def export_sim_player(cfg: dict) -> str:
     return f"{cfg['id']}: {stats['n_frames']} frames -> {out.relative_to(DEMO_DIR)}"
 
 
+def _purge_models_package():
+    """Drop any imported top-level `models` package from sys.modules.
+
+    There are TWO packages named `models` in play: this repo's (pointnet2,
+    salsanext) and Kevin's, in his separate denkwelt_deploy checkout. Whichever
+    is imported first wins for the rest of the process -- which is exactly how
+    exporting kevin_sim then salsanext_sim failed with "No module named
+    models.salsanext". _shared_inference.py sidesteps this with importlib
+    aliasing; here, where each export is independent anyway, clearing the
+    binding between candidates is simpler and order-independent.
+    """
+    for name in [m for m in sys.modules if m == "models" or m.startswith("models.")]:
+        del sys.modules[name]
+
+
 def build_sim_render_fn(cfg: dict, ckpt: Path):
     """Load the candidate's model and bind it into its render_*_frame."""
     import json as _json
     import torch
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    _purge_models_package()
+    if cfg["model"] == "kevin_cnn":
+        kevin_deploy = (REPO_ROOT.parent / "masterarbeit_kevinfischer" / "lidar_preprocessing"
+                        / "autoencoder_training" / "denkwelt_deploy")
+        need(kevin_deploy, "Kevin's denkwelt_deploy checkout")
+        sys.path.insert(0, str(kevin_deploy))      # his `models` must win here
+    else:
+        # ...and must not win anywhere else.
+        sys.path[:] = [p for p in sys.path if "denkwelt_deploy" not in p]
+        if str(REPO_ROOT) not in sys.path[:1]:
+            sys.path.insert(0, str(REPO_ROOT))
+
     render_raw = resolve_renderer(cfg["renderer"])
 
     stats_path = REPO_ROOT / "outputs" / "kevin_cnn" / "normalization_stats.json"
@@ -183,6 +211,10 @@ def build_sim_render_fn(cfg: dict, ckpt: Path):
         with open(kevin_deploy / "outputs" / "best_params.json") as f:
             best = _json.load(f)
         model = build_autoencoder(best.get("params", best)).to(device)
+        model.load_state_dict(torch.load(ckpt, map_location=device))
+    elif cfg["model"] == "salsanext":
+        from models.salsanext import SalsaNextMultiTask
+        model = SalsaNextMultiTask().to(device)
         model.load_state_dict(torch.load(ckpt, map_location=device))
     else:
         raise Skip(f"no sim renderer wired for model {cfg['model']!r}")
@@ -586,6 +618,59 @@ def export_media(cfg: dict) -> str:
             f" -> {out.relative_to(DEMO_DIR)}")
 
 
+FONT_FACES = [
+    ("IBM Plex Sans", 400, "IBMPlexSans-400.woff2"),
+    ("IBM Plex Sans", 600, "IBMPlexSans-600.woff2"),
+    ("IBM Plex Mono", 400, "IBMPlexMono-400.woff2"),
+    ("IBM Plex Mono", 500, "IBMPlexMono-500.woff2"),
+]
+
+
+def export_fonts(cfg: dict = None) -> str:
+    """Generate assets/css/fonts.css with the woff2 files inlined as data: URIs.
+
+    data: rather than url(../fonts/x.woff2) because several Chrome builds
+    refuse to load font files over file://, which is precisely the delivery
+    mode an examiner will use -- and the failure is silent, just a fallback to
+    system-ui. The base64 overhead (~33%) is a few tens of KB here and buys
+    typography that cannot quietly disappear.
+    """
+    fonts_dir = DEMO_DIR / "assets" / "fonts"
+    need(fonts_dir, "assets/fonts directory")
+
+    blocks = [
+        "/* GENERATED FILE -- do not edit by hand.",
+        " * Rebuild with:  python demo/build_demo.py --fonts",
+        " *",
+        " * IBM Plex, latin subset, inlined as data: URIs so the page keeps its",
+        " * typography when opened from a folder with no network. See VENDOR.md.",
+        " * Licence: SIL OFL 1.1, shipped alongside in assets/fonts/.",
+        " */",
+        "",
+    ]
+    total = 0
+    for family, weight, fname in FONT_FACES:
+        path = fonts_dir / fname
+        if not path.exists():
+            raise Skip(f"font file missing: {fname}")
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        total += path.stat().st_size
+        blocks.append(
+            "@font-face {\n"
+            f"  font-family: '{family}';\n"
+            "  font-style: normal;\n"
+            f"  font-weight: {weight};\n"
+            "  font-display: swap;\n"
+            f"  src: url(data:font/woff2;base64,{data}) format('woff2');\n"
+            "}\n"
+        )
+
+    out = DEMO_DIR / "assets" / "css" / "fonts.css"
+    out.write_text("\n".join(blocks), encoding="utf-8")
+    return (f"fonts: {len(FONT_FACES)} faces, {total/1024:.0f} KB raw "
+            f"-> {out.stat().st_size/1024:.0f} KB css")
+
+
 def export_gallery(cfg: dict) -> str:
     copied = 0
     for src_rel in cfg.get("from", []):
@@ -712,12 +797,16 @@ def main() -> int:
     ap.add_argument("--only", help="comma-separated kind or kind:id selectors")
     ap.add_argument("--check", action="store_true", help="validate payloads, no torch needed")
     ap.add_argument("--report", action="store_true", help="file sizes and budget check")
+    ap.add_argument("--fonts", action="store_true", help="regenerate assets/css/fonts.css")
     args = ap.parse_args()
 
     if args.check:
         return cmd_check()
     if args.report:
         return cmd_report()
+    if args.fonts:
+        print(export_fonts())
+        return 0
     if not (args.all or args.only):
         ap.print_help()
         return 0

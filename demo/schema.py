@@ -111,6 +111,19 @@ def check_manifest(demo_dir: Path) -> list[str]:
         for tab in s.get("tabs", []):
             if tab.get("src") and not (demo_dir / "payloads" / tab["src"]).exists():
                 problems.append(f"manifest: tab {tab.get('label')!r} -> missing {tab['src']}")
+        # gallery/video figure paths are hand-written in the manifest rather than
+        # emitted by an exporter, so a typo here is exactly the kind of silent
+        # 404 the page cannot report to you at a defense.
+        for item in s.get("items", []):
+            for pane in item.get("panes", []):
+                if pane.get("src") and not (demo_dir / "payloads" / pane["src"]).exists():
+                    problems.append(
+                        f"manifest: section {s.get('id')!r} pane {pane.get('label')!r} "
+                        f"-> missing {pane['src']}")
+        for key in ("poster",):
+            for spec in [s] + list(s.get("tabs", [])):
+                if spec.get(key) and not (demo_dir / "payloads" / spec[key]).exists():
+                    problems.append(f"manifest: {key} missing: {spec[key]}")
 
     if not m.get("classes"):
         problems.append("manifest: no classes[] -- swatches and legends will be empty")

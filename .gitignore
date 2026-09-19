@@ -38,3 +38,6 @@ __pycache__/
 venv/
 .pytest_cache/
 .ipynb_checkpoints/
+
+# Per-machine editor/agent scaffolding (dev-server launch configs etc.).
+.claude/
