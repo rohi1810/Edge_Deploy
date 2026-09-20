@@ -17,13 +17,17 @@ DEMO.register("manifest", "main", {
 
   "site": {
     "navBrand": "sim2real lidar",
-    "title": "Sim2Real LiDAR Perception for Autonomous Navigation",
+    "title": "Sim-to-Real Evaluation of Edge-Deployed Perception Models Using LiDAR-Based Environment Reconstruction",
     "subtitle": "Three encoder candidates trained on simulated LiDAR, compared on one shared held-out test set, then run against real Ouster OS1-64 recordings from a Clearpath Jackal.",
-    "author": "TODO — your name",
-    "degree": "Bachelor Thesis",
-    "university": "TODO — university",
-    "department": "TODO — department",
-    "supervisors": ["TODO — supervisor"],
+    "author": "Ahmed Yassine Hachem",
+    "degree": "Bachelor in Applied Artificial Intelligence",
+    "university": "Pristini School of AI",
+    "department": "OTH Amberg-Weiden · Team Automotive",
+    "supervisors": [
+      "Dr. Ameni Youssfi · Pristini School of AI",
+      "Prof. Dr.-Ing. Alexander Prinz · OTH Amberg-Weiden",
+      "Jakob Götz · OTH Amberg-Weiden"
+    ],
     "date": "2026",
     "robot": "Clearpath Jackal · Ouster OS1-64",
     "repoUrl": "https://github.com/ahmed-yh/sim2reallidar",
