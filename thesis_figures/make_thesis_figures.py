@@ -836,10 +836,120 @@ def figure_6_threshold():
     return p
 
 
+# ============================================================ FIGURE 7 =====
+
+def figure_7_classifiers():
+    """The classification comparison the thesis is missing.
+
+    Section 5.6.6 calls classification "a near-tie" on 98.96% vs 98.93% overall
+    point accuracy -- while the same section argues, correctly, that overall
+    accuracy is meaningless here because ~99% of points are environment. This
+    is the same two models scored on the four classes that carry the signal.
+    """
+    fp = REPO / "outputs" / "measured" / "fair_comparison.json"
+    if not fp.exists():
+        print(f"  SKIP figure 7: {fp} not found")
+        return None
+    data = json.loads(fp.read_text())
+    cls = data.get("classification")
+    if not cls:
+        print("  SKIP figure 7: fair_comparison.json has no classification block "
+              "(re-run kevin_pipeline/fair_comparison.py --json-out)")
+        return None
+
+    def curve(key):
+        sw = sorted(cls[key], key=lambda d: d["threshold"])
+        return (np.array([d["threshold"] for d in sw]),
+                np.array([d["macroF1"] for d in sw]) * 100, sw)
+
+    th, pn2, pn2_sw = curve("pointnet2")
+    _, salsa, salsa_sw = curve("salsanext")
+    matched = cls.get("salsanext_column_matched")
+    mt = np.array([d["macroF1"] for d in sorted(matched, key=lambda d: d["threshold"])]) * 100         if matched else None
+
+    fig = plt.figure(figsize=(7.6, 4.15))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.35, 1.35, 1.05],
+                          left=0.08, right=0.985, top=0.695, bottom=0.175, wspace=0.40)
+
+    axA = fig.add_subplot(gs[0, 0])
+    axA.plot(th, pn2, "-o", color=C_AFTER, linewidth=1.9, markersize=3.5)
+    axA.plot(th, salsa, "-o", color=C_BEFORE, linewidth=1.9, markersize=3.5)
+    axA.text(th[-1] + 0.012, pn2[-1] - 1.4, "PointNet++", fontsize=7.8, fontweight="bold",
+             color=C_AFTER, va="center")
+    axA.text(th[-1] + 0.012, salsa[-1] + 1.4, "SalsaNext", fontsize=7.8, fontweight="bold",
+             color=C_BEFORE, va="center")
+    # The column-matched curve is deliberately NOT drawn: it lands within 0.001
+    # of the unmatched one at every threshold, so plotting it adds a line that
+    # is indistinguishable from its neighbour while colliding with the labels.
+    # The number is reported in the panel instead, which is what carries it.
+    axA.set_xlabel("confidence threshold", fontsize=8.5)
+    axA.set_ylabel("macro-F1 over object classes (%)", fontsize=8.5)
+    axA.set_title("Both classifiers, swept", fontsize=9, color=INK, loc="left", pad=7)
+    axA.set_xlim(th[0] - 0.02, th[-1] + 0.22)
+    clean(axA)
+
+    # per-class at the shipped threshold
+    def at(sw, t):
+        return next(d for d in sw if abs(d["threshold"] - t) < 1e-9)
+    a, b = at(pn2_sw, 0.97), at(salsa_sw, 0.97)
+    names = {4: "Sphere", 5: "Cylinder", 6: "Box 2", 7: "Box 1"}
+    ids = [4, 5, 6, 7]
+    fa = [next(r["f1"] for r in a["rows"] if r["classId"] == c) * 100 for c in ids]
+    fb = [next(r["f1"] for r in b["rows"] if r["classId"] == c) * 100 for c in ids]
+
+    axB = fig.add_subplot(gs[0, 1])
+    y = np.arange(len(ids))[::-1]
+    axB.barh(y + 0.19, fa, 0.36, color=C_AFTER)
+    axB.barh(y - 0.19, fb, 0.36, color=C_BEFORE)
+    for yy, va, vb in zip(y, fa, fb):
+        axB.text(va + 1.0, yy + 0.19, f"{va:.0f}", va="center", fontsize=7.4,
+                 fontweight="bold", color=C_AFTER)
+        axB.text(vb + 1.0, yy - 0.19, f"{vb:.0f}", va="center", fontsize=7.4,
+                 fontweight="bold", color=C_BEFORE)
+    axB.set_yticks(y); axB.set_yticklabels([names[c] for c in ids], fontsize=8.5, color=INK)
+    axB.set_xlim(0, 108); axB.set_xlabel("F1 at threshold 0.97 (%)", fontsize=8.5)
+    axB.set_title("Per class, where it matters", fontsize=9, color=INK, loc="left", pad=7)
+    clean(axB, xgrid=True, ygrid=False)
+
+    gap = b["macroF1"] - a["macroF1"]
+    cyl_a = next(r["f1"] for r in a["rows"] if r["classId"] == 5)
+    cyl_b = next(r["f1"] for r in b["rows"] if r["classId"] == 5)
+    rows = [
+        ("Overall point accuracy", "98.96% vs 98.93%", False, None),
+        ("...but ~99% of points are environment", "", False, None),
+        None,
+        ("Macro-F1 at arg-max", f"{pn2[0]:.1f}% vs {salsa[0]:.1f}%", False, None),
+        ("Macro-F1 at 0.97", f"{a['macroF1']*100:.1f}% vs {b['macroF1']*100:.1f}%", True, C_BEFORE),
+        ("Cylinder F1 at 0.97", f"{cyl_a*100:.1f}% vs {cyl_b*100:.1f}%", True, C_BEFORE),
+    ]
+    if mt is not None:
+        rows += [None, ("Same, on PointNet++'s own rays", f"{mt[list(th).index(0.97)]:.1f}% (identical)", False, None)]
+    axC = fig.add_subplot(gs[0, 2])
+    summary_panel(axC, rows, header="PointNet++ vs SalsaNext")
+
+    titles(fig,
+           "Classification is not a near-tie once environment is excluded",
+           f"On overall point accuracy the two are within 0.03 points. On the four object classes at the shipped threshold,\n"
+           f"SalsaNext leads by {gap*100:.1f} F1 points, and by {(cyl_b-cyl_a)*100:.1f} on cylinder - the weakest class for both.",
+           x=0.02, y=0.975, sub_dy=0.066)
+
+    fig.text(0.02, 0.028,
+             "Source: outputs/measured/fair_comparison.json (kevin_pipeline/fair_comparison.py --json-out), 1,140 held-out SIMULATED test samples, one shared forward pass per model.\n"
+             "Each model is scored in its own native domain: PointNet++ on its 32,768 decimated points, SalsaNext on the valid cells of its 64x1024 grid. The dashed curve restricts\n"
+             "SalsaNext to the same every-2nd-azimuth rays PointNet++ is given, so the comparison is not confounded by sampling density. Reconstruction is unaffected: PointNet++ still leads 7.5x.",
+             fontsize=6.3, color=MUTED, ha="left", va="bottom")
+
+    p = OUT / "fig7_classifier_head_to_head.png"
+    fig.savefig(p, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    return p
+
+
 if __name__ == "__main__":
     made = []
     for fn in (figure_1_drift, figure_2_cloud, figure_3_encoders,
-               figure_4_jetson, figure_5_decimation, figure_6_threshold):
+               figure_4_jetson, figure_5_decimation, figure_6_threshold,
+               figure_7_classifiers):
         p = fn()
         if p:
             made.append(p)

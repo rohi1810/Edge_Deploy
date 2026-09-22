@@ -48,11 +48,68 @@ import torch.nn.functional as F
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from dataset import PointCloudDataset, resolve_recording_path  # noqa: E402
-from models.pointnet2 import PointNet2MultiTask  # noqa: E402
+from dataset import CLASS_NAMES, PointCloudDataset, resolve_recording_path  # noqa: E402
+from models.pointnet2 import NUM_CLASSES, PointNet2MultiTask  # noqa: E402
 from models.salsanext import SalsaNextMultiTask  # noqa: E402
 from salsanext_dataset import RangeImageDataset  # noqa: E402
+from dataset import COL_STRIDE  # noqa: E402
 from sensor import N_COLS, N_RINGS  # noqa: E402
+
+
+# Thresholds swept for BOTH classifiers. Scoring a threshold is a comparison
+# against a confidence the network has already produced, so the whole sweep
+# rides on one forward pass -- one confusion matrix per threshold, not one
+# evaluation pass per threshold.
+SWEEP = (0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.97, 0.99, 0.995)
+
+
+def apply_threshold(pred, conf, t):
+    """Suppress only low-confidence OBJECT predictions. Demoting a
+    low-confidence environment prediction to environment is a no-op, and
+    promoting it to an object would invent detections."""
+    if t <= 0:
+        return pred
+    return torch.where((pred > 0) & (conf < t), torch.zeros_like(pred), pred)
+
+
+def score_confusion(cm: np.ndarray) -> dict:
+    """confusion [true, pred] -> per-class rows, macro-F1 over OBJECT classes,
+    overall accuracy.
+
+    Macro-F1 excludes the environment class deliberately: it is ~99% of every
+    scan and scores ~0.999, so including it would swamp every change the
+    threshold actually makes to the four classes that matter.
+    """
+    rows = []
+    for c in range(cm.shape[0]):
+        true_n, pred_n = int(cm[c].sum()), int(cm[:, c].sum())
+        if true_n == 0 and pred_n == 0:
+            continue
+        recall = cm[c, c] / true_n if true_n else float("nan")
+        precision = cm[c, c] / pred_n if pred_n else float("nan")
+        f1 = (2 * precision * recall / (precision + recall)
+              if precision + recall > 0 else 0.0)
+        rows.append({"classId": c, "name": CLASS_NAMES[c], "truePoints": true_n,
+                     "recall": float(recall), "precision": float(precision),
+                     "f1": float(f1)})
+    objs = [r for r in rows if r["classId"] > 0]
+    return {"rows": rows,
+            "macroF1": sum(r["f1"] for r in objs) / len(objs) if objs else 0.0,
+            "overallAcc": float(np.trace(cm) / max(cm.sum(), 1))}
+
+
+def sweep_report(name: str, cms: dict) -> list[dict]:
+    print()
+    print(f"--- {name}: confidence-threshold sweep (one shared forward pass) ---")
+    print(f"{'threshold':>10} {'macro-F1':>10} {'overall acc':>12}   per-class F1")
+    out = []
+    for t in sorted(cms):
+        sc = score_confusion(cms[t])
+        objs = [r for r in sc["rows"] if r["classId"] > 0]
+        per = " ".join(f"{r['name'][:4]}={r['f1']:.3f}" for r in objs)
+        print(f"{t:>10.3g} {sc['macroF1']:>10.3f} {sc['overallAcc']:>11.2%}   {per}")
+        out.append({"threshold": t, **sc})
+    return out
 
 
 def load_full_range_grid(npz_path: Path) -> np.ndarray:
@@ -76,13 +133,31 @@ def pointnet2_reprojected_metrics(recordings_dir: Path, test_ids: list[str],
     ds = PointCloudDataset(recordings_dir, test_ids)
 
     mse_total, ssim_total, correct, total_pts, n = 0.0, 0.0, 0, 0, 0
+    cms = {t: np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64) for t in SWEEP}
     with torch.no_grad():
         for sid, (xyz_in, cls_in) in zip(test_ids, ds):
             out = model(xyz_in.unsqueeze(0).to(device))
             recon = out["recon_points"][0]  # (2048, 3)
-            pred_cls = out["class_logits"][0].argmax(dim=-1).cpu()
+            logits = out["class_logits"][0]
+            argmax = logits.argmax(dim=-1)
+            conf = logits.softmax(dim=-1).gather(-1, argmax.unsqueeze(-1)).squeeze(-1)
+            pred_cls = argmax.cpu()
             correct += (pred_cls == cls_in).sum().item()
             total_pts += cls_in.numel()
+
+            # Classification is scored on PointNet++'s OWN decimated points,
+            # not on the reprojected grid: reprojection exists to put
+            # RECONSTRUCTION on a shared scale, and pushing labels through a
+            # nearest-neighbour step would score the reprojection as much as
+            # the classifier. This keeps these numbers directly comparable to
+            # evaluate.py's.
+            truth = cls_in.to(device).reshape(-1)
+            for t, cm in cms.items():
+                p_t = apply_threshold(argmax, conf, t).reshape(-1)
+                idx = (truth * NUM_CLASSES + p_t).cpu()
+                cm += np.bincount(idx.numpy(),
+                                  minlength=NUM_CLASSES * NUM_CLASSES
+                                  ).reshape(NUM_CLASSES, NUM_CLASSES)
 
             npz_path = resolve_recording_path(recordings_dir, sid)
             xyz_grid = load_full_range_grid(npz_path)
@@ -119,7 +194,8 @@ def pointnet2_reprojected_metrics(recordings_dir: Path, test_ids: list[str],
                                    data_range=1.0).item()
             n += 1
 
-    return {"mse": mse_total / n, "ssim": ssim_total / n, "acc": correct / max(total_pts, 1), "n": n}
+    return {"mse": mse_total / n, "ssim": ssim_total / n,
+            "acc": correct / max(total_pts, 1), "n": n, "cms": cms}
 
 
 def salsanext_metrics(recordings_dir: Path, test_ids: list[str], checkpoint: Path,
@@ -139,12 +215,41 @@ def salsanext_metrics(recordings_dir: Path, test_ids: list[str], checkpoint: Pat
     ds = RangeImageDataset(recordings_dir, test_ids, max_range)
 
     mse_total, ssim_total, correct, total_px, n = 0.0, 0.0, 0, 0, 0
+    cms = {t: np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64) for t in SWEEP}
+    # A second, column-matched confusion set. SalsaNext natively sees all 1024
+    # azimuth columns while PointNet++ is fed every 2nd (dataset.COL_STRIDE=2),
+    # so the plain comparison scores SalsaNext on exactly twice as many points.
+    # This one restricts it to the same rays PointNet++ actually gets, which is
+    # the only way the per-class head-to-head is not confounded by density.
+    cms_matched = {t: np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64) for t in SWEEP}
+    col_keep = torch.zeros(N_COLS, dtype=torch.bool, device=device)
+    col_keep[::COL_STRIDE] = True
     with torch.no_grad():
         for inp, range_n, cls, valid in ds:
             inp, range_n, cls, valid = (t.unsqueeze(0).to(device) for t in (inp, range_n, cls, valid))
             out = model(inp)
             recon_n = out["recon_range"]
-            pred_cls = out["class_logits"].argmax(dim=1)
+            logits = out["class_logits"]
+            pred_cls = logits.argmax(dim=1)
+            conf = logits.softmax(dim=1).gather(1, pred_cls.unsqueeze(1)).squeeze(1)
+
+            # Scored only where the scan actually returned something. A
+            # no-return cell carries no ground truth and must not count as a
+            # correct environment hit -- which would inflate every number
+            # here, since no-returns are labelled 0 exactly like environment.
+            vb = valid.bool()
+            m = vb.reshape(-1)
+            m_matched = (vb & col_keep[None, None, :]).reshape(-1)
+            truth_all = cls.reshape(-1)
+            truth, truth_m = truth_all[m], truth_all[m_matched]
+            for t in SWEEP:
+                p_all = apply_threshold(pred_cls, conf, t).reshape(-1)
+                for sel, tru, acc in ((m, truth, cms[t]),
+                                      (m_matched, truth_m, cms_matched[t])):
+                    idx = (tru * NUM_CLASSES + p_all[sel]).cpu()
+                    acc += np.bincount(idx.numpy(),
+                                       minlength=NUM_CLASSES * NUM_CLASSES
+                                       ).reshape(NUM_CLASSES, NUM_CLASSES)
 
             diff2 = (recon_n - range_n) ** 2 * valid
             mse_total += (diff2.sum() / valid.sum().clamp(min=1)).item()
@@ -154,7 +259,9 @@ def salsanext_metrics(recordings_dir: Path, test_ids: list[str], checkpoint: Pat
             total_px += valid.sum().item()
             n += 1
 
-    return {"mse": mse_total / n, "ssim": ssim_total / n, "acc": correct / max(total_px, 1), "n": n}
+    return {"mse": mse_total / n, "ssim": ssim_total / n,
+            "acc": correct / max(total_px, 1), "n": n,
+            "cms": cms, "cms_matched": cms_matched}
 
 
 def main():
@@ -220,6 +327,36 @@ def main():
     print("  Kevin's CNN has no classification output at all -- it was never built with one, so")
     print("  it's excluded here rather than given an invented number.")
 
+    # Per-class, for BOTH classifiers, at every swept threshold. Overall
+    # accuracy is ~99% for both because ~99% of points are environment; the
+    # object classes are where the two candidates can actually differ, and
+    # until now only PointNet++ had a per-class breakdown.
+    pn2_sweep = sweep_report("PointNet++ (own 32,768 decimated points)", pn2.pop("cms"))
+    salsa_sweep = sweep_report("SalsaNext (own 64x1024 grid, valid cells only)", salsa.pop("cms"))
+    salsa_matched = sweep_report(
+        f"SalsaNext (column-matched: every {COL_STRIDE}nd azimuth, same rays as PointNet++)",
+        salsa.pop("cms_matched"))
+
+    def at(sweep, t):
+        return next(r for r in sweep if abs(r["threshold"] - t) < 1e-9)
+
+    print()
+    print("=== per-class F1 head-to-head (threshold 0.97) ===")
+    a, b = at(pn2_sweep, 0.97), at(salsa_sweep, 0.97)
+    print(f"  {'class':<12} {'PointNet++':>12} {'SalsaNext':>12}")
+    for ra in a["rows"]:
+        if ra["classId"] == 0:
+            continue
+        rb = next((r for r in b["rows"] if r["classId"] == ra["classId"]), None)
+        print(f"  {ra['name']:<12} {ra['f1']:>12.3f} {(rb['f1'] if rb else float('nan')):>12.3f}")
+    cmatch = at(salsa_matched, 0.97)
+    print(f"  {'macro-F1':<12} {a['macroF1']:>12.3f} {b['macroF1']:>12.3f}")
+    print(f"  {'':<12} {'':>12} {'':>12}")
+    print(f"  SalsaNext macro-F1 restricted to PointNet++'s own rays: {cmatch['macroF1']:.3f}")
+    print()
+    print("  Overall point accuracy is a near-tie (98.96% vs 98.93%) because ~99% of")
+    print("  points are environment. The object classes are the real comparison.")
+
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         measured = {
@@ -232,6 +369,16 @@ def main():
             measured["kevin_cnn"] = {"mse": kevin["mse"], "ssim": kevin["ssim"], "pointAcc": None}
         args.json_out.write_text(json.dumps({
             "script": "kevin_pipeline/fair_comparison.py",
+            "classification": {
+                "_comment": ("Per-class metrics for the two candidates that HAVE a "
+                             "classifier, each scored in its own native domain: "
+                             "PointNet++ on its 32,768 decimated points, SalsaNext on "
+                             "the valid cells of its 64x1024 grid. Kevin's CNN has no "
+                             "classifier and is absent rather than zero."),
+                "pointnet2": pn2_sweep,
+                "salsanext": salsa_sweep,
+                "salsanext_column_matched": salsa_matched,
+            },
             "testSamples": len(test_ids),
             "sharedMaxRange": max_range,
             "checkpoints": {"pointnet2": str(args.pointnet2_checkpoint),
