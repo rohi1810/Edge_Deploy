@@ -24,23 +24,23 @@ model's own guess, with nothing to check it against here.
     ros2 run <your_package> live_inference_node.py --ros-args \\
         -p model:=salsanext -p checkpoint:=/path/to/best_multitask_model.pt
 
-NOT tested against a real Ouster driver or a live ROS2 environment -- this
-development machine has no ROS2 install (confirmed: `import rclpy` fails
-here). Things specifically needing verification against your actual setup:
-  1. Your OS1's channel count and horizontal-resolution setting must
-     produce (64, 1024) scans to match what the trained models expect --
-     this node checks msg.height/msg.width on every scan and refuses to run
-     inference on a mismatched shape rather than silently resampling into
-     something the model was never trained on. Confirmed: OS1-64 matches
-     the channel count; horizontal resolution (512/1024/2048 cols/rev) is
-     a separate sensor setting, still needs setting to 1024 if it isn't
-     already.
-  2. This assumes Ouster's driver marks no-return cells as NaN, not (0,0,0)
-     -- verify against your driver version/config; a silent (0,0,0)-for-
-     no-return convention would look like a valid point at the sensor
-     origin instead of "no data" (see _shared_inference.py's `valid` masks).
-  3. The actual topic name -- /ouster/points is ouster-ros's documented
-     default, but launch-file namespacing can change it.
+This node itself has NOT run on the robot -- this development machine has no
+ROS2 install (`import rclpy` fails here). The per-scan logic it calls has
+been run over all three recorded bags (run_inference_on_bag.py), which
+settled what used to be open here (checked 2026-09-27 against the bags'
+/ouster/metadata and /ouster/points):
+  1. Scan shape: the recorded OS1-64 runs lidar_mode 1024x10, i.e. (64, 1024)
+     -- what the models expect. This node still checks msg.height/msg.width
+     on every scan and refuses a mismatch rather than silently resampling.
+  2. No-returns: ouster-ros marks them NaN in these bags. A (0,0,0)
+     convention would be harmless for PointNet++ anyway: returns outside the
+     simulated sensor's range are dropped (sensor.SIM_RANGE_M).
+  3. Point order: the Ouster's ring/column order is the reverse of the
+     simulator's; the PointNet++ path reorders every scan, and on the first
+     scan refuses to run if the order isn't the one it expects
+     (sensor.check_sim_order).
+  4. The topic name -- /ouster/points is ouster-ros's documented default,
+     but launch-file namespacing can change it.
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _shared_inference import N_COLS, N_RINGS, ModelRunner  # noqa: E402
+from _shared_inference import N_COLS, N_RINGS, ModelRunner, SkipScan  # noqa: E402
 
 
 def numpy_to_image_msg(arr: np.ndarray, header) -> RosImage:
@@ -130,7 +130,11 @@ class LiveInferenceNode(Node):
         pts = pc2.read_points_numpy(msg, field_names=("x", "y", "z"), skip_nans=False)
         xyz = pts.reshape(N_RINGS, N_COLS, 3).astype(np.float32)
 
-        combined, mse = self.runner.run(xyz)
+        try:
+            combined, mse = self.runner.run(xyz)
+        except SkipScan as e:
+            self.get_logger().warning(f"skipped a scan: {e}", throttle_duration_sec=5.0)
+            return
         self.viz_pub.publish(numpy_to_image_msg(combined, msg.header))
         self.get_logger().debug(f"[{self.model_name}] recon mse={mse:.4f}")
 

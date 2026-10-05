@@ -160,6 +160,7 @@ Consequence: the decoders' structure has **zero effect on the deployment latency
 above**. It only costs training time, on the Quadro, which has headroom — which is why
 the two decoders are free to be structured completely differently.
 
+
 ### Why the two decoders differ structurally
 
 **`ReconstructionDecoder`** takes the latent `z` **alone** — no path back to the input.
@@ -226,30 +227,70 @@ Real recordings come from an **Ouster OS1-64 on a Clearpath Jackal** over ROS2, 
 64 rings match the simulated sensor's grid directly.
 
 ```bash
-# offline, over a recorded bag -- needs no ROS2 installation (uses `rosbags`)
-python3 ros2_inference/run_inference_on_bag.py \
-    --bag real_bags/bag3_20260910_152806 --topic /ouster/points
+# offline, over a recorded bag -- needs no ROS2 installation (uses `rosbags`);
+# PointNet++ epoch39 by default. Writes outputs/real_inference/<bag>/:
+# inference.mp4 (every scan, H.264), predictions.npz, summary.json
+python ros2_inference/run_inference_on_bag.py --bag real_bags/bag3_20260910_152806
+
+# where the model keeps seeing objects across scans -> objects.json, objects_map.png
+python real_eval/detect_persistent_objects.py outputs/real_inference/bag3_20260910_152806
+
+# evidence for the input fixes below: with labels (simulated test split), and label-free (the bags)
+python real_eval/before_after.py sim
+python real_eval/before_after.py bags
 
 # live, on the robot, inside a ROS2 environment
 ros2 run ... ros2_inference/live_inference_node.py
 ```
 
 Both share `ros2_inference/_shared_inference.py`, so the offline and live paths cannot
-drift apart.
+drift apart. The offline run streams the bag (one scan in memory), skips and counts
+unusable scans instead of dying on them, and fails if more than 1% are skipped.
 
-### Two things measured on real data, and one removed
+### Real scans must reach the model the way simulated ones did
+
+The Ouster and the simulator share the 64 x 1024 grid **shape**, not its **order**: the
+Ouster's row 0 is its highest beam and its columns run clockwise from 0°; the simulator's
+row 0 is its lowest beam and its columns run counter-clockwise from -180° (`sensor.py`).
+PointNet++'s ball query keeps the first 32 in-range points *by array index*, so order is
+part of the input. Until 2026-09-28 real scans went in in Ouster order, unpadded, at a
+point count training never used. Scoring the labelled simulated test split as the real
+sensor delivers it (`real_eval/before_after.py sim`, 1,140 scans, threshold 0.97):
+
+| input | macro-F1 |
+|---|---|
+| simulator order, training input path | 0.867 |
+| Ouster order, old input path | **0.174** |
+| Ouster order + measured real dropout, old input path | 0.183 |
+| Ouster order + measured real dropout, **fixed** input path | **0.869** |
+
+The fixed path (`_shared_inference.real_scan_to_points`) reorders every real scan into
+simulator order (`sensor.ouster_to_sim_order`), drops returns outside the range the
+simulated sensor ever produced (0.30-120 m), and pads to exactly 32,768 points with the
+same function training uses (`dataset.prepare_points`). It refuses a stream whose order
+doesn't match the expected convention (`sensor.check_sim_order`). Real-bag outputs made
+before this fix — the old `real_bags/*.html` players and videos, and the demo's bag3
+player — show the broken input.
+
+### Measured on real data, and one thing removed
 
 - **Ring-dependent dropout is real and large.** Returns are lost at ~2% on the middle
-  rings, rising to ~34% at ring 63. `real_noise_augment.py` holds the measured 64-element
-  rate array and applies it to simulated scans during fine-tuning.
+  rings, rising to ~34% on the lowest, floor-grazing beam. `real_noise_augment.py` holds
+  the measured 64-element rate array. Until 2026-09-28 it was applied to simulated grids
+  upside down (the measured array is in Ouster row order); the ring-noise fine-tune
+  (`outputs/pointnet2_ringnoise_finetuned`) was trained that way.
 - **False points are not.** An earlier noise model injected spurious near-range points
   at 5%. Measuring the actual rate of isolated near-range spikes in the bags gave
   **0.065%**, so the injection was removed entirely rather than kept at a smaller value.
   It came from misreading a viridis colormap — yellow there is *far*, not near.
-- **Ring order is inverted relative to simulation.** Measured beam elevation in bag3:
-  ring 0 is `+21°` (the highest beam), ring 63 is `-17°`. The simulated convention is the
-  opposite, so the `flipud` that is correct for simulated grids makes real playback
-  upside down. The real path does not flip.
+- **Ring order is inverted relative to simulation.** From the sensor's own metadata:
+  ring 0 is `+21.6°` (the highest beam), ring 63 is `-21.2°`. For *display*, the `flipud`
+  that is correct for simulated grids makes real playback upside down, so the real path
+  does not flip; for the *model*, see above.
+- **Sensor height differs** (~0.63 m real vs 0.535 m simulated). Classification does not
+  depend on it — the encoder sees only neighbourhood-relative coordinates
+  (`tests/test_real_inference.py`) — but the reconstruction branch outputs absolute
+  positions, so part of the real reconstruction error is this offset.
 
 ### What cannot be claimed
 
@@ -439,10 +480,14 @@ sim2real-lidar/
 ├── real_noise_augment.py   measured per-ring dropout, for sim2real fine-tuning
 ├── kevin_pipeline/
 │   └── fair_comparison.py  THE one script that puts all three on one scale
+├── sensor.py               Ouster <-> simulator scan order, the order check, range limits
 ├── ros2_inference/
-│   ├── _shared_inference.py    ModelRunner, shared by both paths below
+│   ├── _shared_inference.py    ModelRunner + real_scan_to_points, shared by both paths below
 │   ├── run_inference_on_bag.py offline over a recorded bag (no ROS2 needed)
 │   └── live_inference_node.py  on-robot ROS2 node
+├── real_eval/
+│   ├── detect_persistent_objects.py  objects the model keeps seeing -> top-down map
+│   └── before_after.py         measured effect of the real-scan input fixes
 ├── viz/
 │   ├── playback_common.py      build_playback_payload + shared rendering
 │   └── gen_playback_{pointnet2,kevin,salsanext}.py

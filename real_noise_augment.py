@@ -63,16 +63,24 @@ REAL_RING_DROPOUT_RATE = np.array([
 ], dtype=np.float32)
 assert REAL_RING_DROPOUT_RATE.shape == (N_RINGS,)
 
+# The same profile in the SIMULATOR's row order (row 0 = lowest beam, see
+# sensor.py), which is the order of every grid the training loaders pass in.
+# Until 2026-09-28 the Ouster-order array above was applied to simulator rows
+# as-is -- upside down, putting the 34% floor-grazing rate on the most upward
+# beam. outputs/pointnet2_ringnoise_finetuned (2026-09-17) was trained so.
+SIM_ORDER_RING_DROPOUT_RATE = REAL_RING_DROPOUT_RATE[::-1].copy()
+
 
 def inject_real_sensor_noise(
     xyz_grid: np.ndarray,
     rng: np.random.Generator,
     cls_grid: np.ndarray | None = None,
-    ring_dropout_rate: np.ndarray = REAL_RING_DROPOUT_RATE,
+    ring_dropout_rate: np.ndarray = SIM_ORDER_RING_DROPOUT_RATE,
 ) -> np.ndarray:
     """xyz_grid: (N_RINGS, N_COLS, 3), NaN (or any non-finite) where the
-    real recording had no return. Returns a NEW array (does not modify
-    xyz_grid in place).
+    real recording had no return, in simulator row order -- pass
+    ring_dropout_rate=REAL_RING_DROPOUT_RATE for a grid in Ouster order.
+    Returns a NEW array (does not modify xyz_grid in place).
 
     cls_grid: (N_RINGS, N_COLS) class labels, if given. Dropout is
     restricted to cells NOT labeled as one of the rare real object classes
@@ -85,7 +93,8 @@ def inject_real_sensor_noise(
     ring_dropout_rate: (N_RINGS,) per-ring extra-dropout probability,
     stacked on top of whatever dropout the simulated scan already has
     (near zero, since sim dropout is geometric-occlusion-only). Defaults
-    to the measured real-hardware profile above; override for experiments.
+    to the measured real-hardware profile above, in simulator row order;
+    override for experiments.
     """
     h, w, _ = xyz_grid.shape
     flat = xyz_grid.reshape(h * w, 3).copy()

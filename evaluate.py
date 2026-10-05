@@ -42,6 +42,38 @@ from losses import chamfer_distance
 from models.pointnet2 import NUM_CLASSES, PointNet2MultiTask
 
 
+def apply_threshold(pred, conf, t):
+    """Only object predictions are suppressed. Demoting a low-confidence
+    *environment* prediction to environment would be a no-op, and promoting
+    it to an object would invent detections."""
+    if t <= 0:
+        return pred
+    return torch.where((pred > 0) & (conf < t), torch.zeros_like(pred), pred)
+
+
+def score(conf_flat):
+    """confusion [true, pred] -> per-class rows, macro-F1, overall accuracy."""
+    cm = conf_flat.reshape(NUM_CLASSES, NUM_CLASSES)
+    out_rows = []
+    for c in range(NUM_CLASSES):
+        true_count = cm[c].sum().item()
+        pred_count = cm[:, c].sum().item()
+        if true_count == 0 and pred_count == 0:
+            continue
+        recall = cm[c, c].item() / true_count if true_count > 0 else float("nan")
+        precision = cm[c, c].item() / pred_count if pred_count > 0 else float("nan")
+        f1 = (2 * precision * recall / (precision + recall)
+              if precision + recall > 0 else 0.0)
+        out_rows.append({"classId": c, "name": CLASS_NAMES[c], "truePoints": true_count,
+                         "recall": recall, "precision": precision, "f1": f1})
+    # Macro-F1 over the OBJECT classes only. Including environment would fold
+    # a ~0.999 F1 on 99% of the points into the average and hide every change
+    # the threshold makes -- which is the whole quantity being optimised.
+    objs = [r for r in out_rows if r["classId"] > 0]
+    macro = sum(r["f1"] for r in objs) / len(objs) if objs else 0.0
+    return out_rows, macro, cm.diag().sum().item() / cm.sum().item()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--recordings-dir", type=Path,
@@ -85,14 +117,6 @@ def main():
                         for t in sweep} if sweep else {})
     recon_total, n_samples = 0.0, 0
 
-    def apply_threshold(pred, conf, t):
-        """Only object predictions are suppressed. Demoting a low-confidence
-        *environment* prediction to environment would be a no-op, and promoting
-        it to an object would invent detections."""
-        if t <= 0:
-            return pred
-        return torch.where((pred > 0) & (conf < t), torch.zeros_like(pred), pred)
-
     with torch.no_grad():
         for xyz, cls in loader:
             xyz, cls = xyz.to(device), cls.to(device)
@@ -115,28 +139,6 @@ def main():
             pred = apply_threshold(pred, conf, args.class_conf_threshold)
             idx = (cls.reshape(-1) * NUM_CLASSES + pred.reshape(-1)).cpu()
             confusion += torch.bincount(idx, minlength=NUM_CLASSES * NUM_CLASSES)
-
-    def score(conf_flat):
-        """confusion [true, pred] -> per-class rows, macro-F1, overall accuracy."""
-        cm = conf_flat.reshape(NUM_CLASSES, NUM_CLASSES)
-        out_rows = []
-        for c in range(NUM_CLASSES):
-            true_count = cm[c].sum().item()
-            pred_count = cm[:, c].sum().item()
-            if true_count == 0 and pred_count == 0:
-                continue
-            recall = cm[c, c].item() / true_count if true_count > 0 else float("nan")
-            precision = cm[c, c].item() / pred_count if pred_count > 0 else float("nan")
-            f1 = (2 * precision * recall / (precision + recall)
-                  if precision + recall > 0 else 0.0)
-            out_rows.append({"classId": c, "name": CLASS_NAMES[c], "truePoints": true_count,
-                             "recall": recall, "precision": precision, "f1": f1})
-        # Macro-F1 over the OBJECT classes only. Including environment would fold
-        # a ~0.999 F1 on 99% of the points into the average and hide every change
-        # the threshold makes -- which is the whole quantity being optimised.
-        objs = [r for r in out_rows if r["classId"] > 0]
-        macro = sum(r["f1"] for r in objs) / len(objs) if objs else 0.0
-        return out_rows, macro, cm.diag().sum().item() / cm.sum().item()
 
     print(f"\nTest Chamfer reconstruction distance: {recon_total / n_samples:.5f}  "
           f"(val was ~0.924 at the restored checkpoint)")

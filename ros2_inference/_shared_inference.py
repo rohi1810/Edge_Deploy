@@ -30,18 +30,59 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "viz"))
 
+from dataset import COL_STRIDE, RING_STRIDE, prepare_points  # noqa: E402
 from playback_common import class_rgb, label_row, range_rgb  # noqa: E402
-from sensor import N_COLS, N_RINGS  # noqa: E402
+from sensor import N_COLS, N_RINGS, SIM_RANGE_M, check_sim_order, ouster_to_sim_order  # noqa: E402
 
-# NOT orient()-ed like the simulated-data playbacks (viz/): that flip was
-# verified against the SIMULATED sensor's ring order ("ring 0 = lowest,
-# ground-facing beam"), which is a property of the simulation's LiDAR
-# plugin, not a law of physics. Checked directly against this project's own
-# real Ouster OS1-64 bags (mean elevation angle per ring, see project notes,
-# 2026-09-14): ring 0 is the HIGHEST beam (~+21 deg) and ring 63 the LOWEST
-# (~-17 deg) -- the OPPOSITE of the simulated convention. A raw (ring, col)
-# grid rendered row-0-at-top is therefore ALREADY correct for real data;
-# applying the simulated flip on top of it was upside down.
+# DISPLAY: not orient()-ed like the simulated-data playbacks (viz/): that
+# flip was verified against the SIMULATED sensor's ring order ("ring 0 =
+# lowest, ground-facing beam"), a property of the simulation's LiDAR plugin,
+# not a law of physics. On the real Ouster OS1-64 ring 0 is the HIGHEST beam
+# (+21.6 deg) and ring 63 the LOWEST (-21.2 deg, /ouster/metadata) -- the
+# OPPOSITE convention -- so a raw (ring, col) grid rendered row-0-at-top is
+# already the right way up for real data.
+#
+# MODEL INPUT: the same mismatch matters far more there. PointNet++ groups
+# neighbourhoods by array index, so real scans are put into simulator order
+# (sensor.ouster_to_sim_order) before they reach it -- see
+# real_scan_to_points. The SalsaNext and Kevin CNN paths below still get
+# Ouster order; they were out of scope for that fix (2026-09-28).
+
+
+class SkipScan(Exception):
+    """A scan the PointNet++ path declines to classify, with the reason. The
+    bag runner and the live node count or log these instead of dying on them."""
+
+
+# SA1 samples 4,096 centres; a scan with fewer real points than that would be
+# mostly padding duplicates -- nothing like what the model was trained on.
+MIN_VALID_POINTS = 4096
+
+# For each cell of the DECIMATED simulator-order grid (what prepare_points
+# flattens), the flat index of the Ouster-grid cell it came from.
+_SIM_DEC_TO_OUSTER = ouster_to_sim_order(
+    np.arange(N_RINGS * N_COLS).reshape(N_RINGS, N_COLS))[::RING_STRIDE, ::COL_STRIDE].reshape(-1)
+
+
+def real_scan_to_points(xyz_grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(N_RINGS, N_COLS, 3) scan as the Ouster driver delivers it -> exactly
+    what training fed the model: (N_POINTS, 3) float32 in simulator order,
+    padded the same way (dataset.prepare_points). Also returns ouster_idx:
+    ouster_idx[i] is the flat index in xyz_grid of real point i; the points
+    after len(ouster_idx) are padding.
+
+    Returns outside the range the simulated sensor ever produced
+    (sensor.SIM_RANGE_M) count as no-returns -- that includes (0,0,0)."""
+    with np.errstate(invalid="ignore"):
+        r = np.linalg.norm(xyz_grid, axis=-1)
+        inside = (r >= SIM_RANGE_M[0]) & (r <= SIM_RANGE_M[1])
+    n_valid = int(inside.reshape(-1)[_SIM_DEC_TO_OUSTER].sum())
+    if n_valid < MIN_VALID_POINTS:
+        raise SkipScan(f"only {n_valid} valid returns in the classified columns "
+                       f"(need {MIN_VALID_POINTS})")
+    sim = ouster_to_sim_order(np.where(inside[..., None], xyz_grid, np.nan))
+    pts, _, kept = prepare_points(sim, pad_seed=0)
+    return pts, _SIM_DEC_TO_OUSTER[kept]
 
 
 class ModelRunner:
@@ -61,6 +102,7 @@ class ModelRunner:
         self.class_conf_threshold = class_conf_threshold
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self._load_model(model_name, checkpoint_path)
+        self._order_checked = False
 
     def _load_model(self, name: str, checkpoint_path: Path):
         if name == "pointnet2":
@@ -120,6 +162,9 @@ class ModelRunner:
     def run_detailed(self, xyz_grid: np.ndarray) -> dict:
         """As run(), plus "pred_class_counts": {class_id: n_points} over the
         THRESHOLDED predictions, or None for a model with no classifier.
+        PointNet++ also returns "points" (n, 3) -- the classified points,
+        sensor frame -- with their argmax class "pred" and softmax "conf",
+        and raises SkipScan for a scan it declines to classify.
 
         These are predictions, not ground truth -- real LiDAR carries no
         laser_retro, so there is nothing to check them against. Anything
@@ -137,37 +182,39 @@ class ModelRunner:
         return {int(i): int(c) for i, c in zip(ids.tolist(), counts.tolist())}
 
     def _run_pointnet2(self, xyz_grid: np.ndarray) -> dict:
-        # Same azimuth-stride-2 decimation dataset.py's _load_raw uses, but
-        # WITHOUT the training-time random padding to a fixed point count --
-        # that padding exists only to keep a training BATCH's tensor shapes
-        # uniform; a single scan has no such constraint.
-        xyz = xyz_grid[:, ::2].reshape(-1, 3)
-        finite = np.isfinite(xyz).all(axis=-1)
-        xyz_in = xyz[finite]
-        x = torch.from_numpy(xyz_in).unsqueeze(0).to(self.device)
-        out = self.model(x)
+        if not self._order_checked:
+            # Once per stream: a driver configured differently is refused
+            # rather than fed to the model silently misordered.
+            check_sim_order(ouster_to_sim_order(xyz_grid))
+            self._order_checked = True
+
+        pts, ouster_idx = real_scan_to_points(xyz_grid)
+        out = self.model(torch.from_numpy(pts).unsqueeze(0).to(self.device))
         recon = out["recon_points"][0]  # (2048, 3), free-form -- needs reprojection to plot
 
         range_native = np.linalg.norm(xyz_grid, axis=-1)
-        valid = np.isfinite(range_native)
+        with np.errstate(invalid="ignore"):
+            valid = (range_native >= SIM_RANGE_M[0]) & (range_native <= SIM_RANGE_M[1])
         xyz_valid = torch.from_numpy(xyz_grid[valid]).float().to(self.device)
         dists = torch.cdist(xyz_valid, recon)
         nn_range = recon[dists.argmin(dim=1)].norm(dim=-1).cpu().numpy()
         recon_range_grid = np.full_like(range_native, np.nan)
         recon_range_grid[valid] = nn_range
 
-        # class_logits is per INPUT point (the decimated, stride-2 set), not
-        # per native cell -- scatter back to the columns actually classified
-        # via the SAME `finite` mask xyz_in was built from, leaving the odd
-        # (never-classified) columns dark rather than fabricating a value.
-        probs = torch.softmax(out["class_logits"][0], dim=-1)
-        conf, pred_cls_dec = probs.max(dim=-1)
-        pred_cls_dec = torch.where(conf >= self.class_conf_threshold, pred_cls_dec,
-                                    torch.zeros_like(pred_cls_dec))
-        pred_cls_dec = pred_cls_dec.cpu().numpy()
-        pred_grid_dec = np.zeros((N_RINGS, N_COLS // 2), dtype=np.uint8)
-        pred_grid_dec.reshape(-1)[finite] = pred_cls_dec
-        pred_grid = np.repeat(pred_grid_dec, 2, axis=1)
+        # One prediction per REAL input point: the padding duplicates at the
+        # end of the input are dropped, and ouster_idx puts each prediction
+        # back in the cell it came from.
+        n = len(ouster_idx)
+        conf, pred = torch.softmax(out["class_logits"][0, :n], dim=-1).max(dim=-1)
+        conf, pred = conf.cpu().numpy(), pred.cpu().numpy()
+        shown = np.where(conf >= self.class_conf_threshold, pred, 0).astype(np.uint8)
+        pred_grid = np.zeros(N_RINGS * N_COLS, dtype=np.uint8)
+        pred_grid[ouster_idx] = shown
+        pred_grid = pred_grid.reshape(N_RINGS, N_COLS)
+        # Only even columns are classified (every-2nd-column decimation, and
+        # the reorder keeps parity); each odd column shows its left
+        # neighbour -- for the picture only, never counted.
+        pred_grid[:, 1::2] = pred_grid[:, 0::2]
 
         real_norm = np.clip(range_native[valid], 0, self.max_range) / self.max_range
         pred_norm = np.clip(nn_range, 0, self.max_range) / self.max_range
@@ -179,8 +226,8 @@ class ModelRunner:
             label_row(range_rgb(recon_range_grid), "RECONSTRUCTED RANGE"), gap,
             label_row(class_rgb(pred_grid), "PREDICTED CLASS (no ground truth on real data)"),
         ], axis=0)
-        return {"image": combined, "mse": mse,
-                "pred_class_counts": self._class_counts(pred_grid)}
+        return {"image": combined, "mse": mse, "pred_class_counts": self._class_counts(shown),
+                "points": pts[:n], "pred": pred, "conf": conf}
 
     def _run_salsanext(self, xyz_grid: np.ndarray) -> dict:
         range_ = np.linalg.norm(xyz_grid, axis=-1)

@@ -57,15 +57,9 @@ def resolve_recording_path(recordings_dir: Path, sample_id: str) -> Path:
     return recordings_dir / f"{sample_id}.npz"
 
 
-def _load_raw(npz_path: Path, augment_rng: np.random.Generator | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """One recording -> decimated (xyz, class) point arrays, no-return
-    points dropped, padded back to exactly N_POINTS by resampling existing
-    valid points (keeps every sample's tensor shape identical for batching).
-
-    augment_rng: if given, injects synthetic real-sensor noise (see
-    real_noise_augment.py) into the raw grid before decimation -- pass this
-    only for TRAINING samples (never val/test), to close part of the
-    sim2real gap without needing any real labeled data."""
+def load_grid(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """One raw recording -> (xyz (N_RINGS, N_COLS, 3), class (N_RINGS, N_COLS)),
+    in the simulator's own row/column order (see sensor.py)."""
     d = np.load(npz_path)
     x, y, z, intensity = d["x"], d["y"], d["z"], d["intensity"]
     if x.size != N_RINGS * N_COLS:
@@ -73,31 +67,59 @@ def _load_raw(npz_path: Path, augment_rng: np.random.Generator | None = None) ->
 
     xyz = np.stack([x, y, z], axis=-1).reshape(N_RINGS, N_COLS, 3)
     cls = np.rint(intensity).astype(np.int64).reshape(N_RINGS, N_COLS)
+    return xyz, cls
+
+
+def prepare_points(xyz_grid: np.ndarray, cls_grid: np.ndarray | None = None,
+                   pad_seed: int = 0) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """The model's input preprocessing -- the ONE implementation, shared by
+    training (_load_raw) and real-data inference (ros2_inference/
+    _shared_inference.py), so the two cannot drift apart again. They did
+    once: real scans went in unpadded, at a point count training never used.
+
+    (N_RINGS, N_COLS, 3) grid in SIMULATOR order (see sensor.py) ->
+    decimated, no-return points dropped, padded back to exactly N_POINTS by
+    resampling existing valid points (identical tensor shapes for batching,
+    and the point count the model was trained on).
+
+    Returns (xyz (N_POINTS, 3) float32, cls (N_POINTS,) or None, kept):
+    kept[i] is the index of real point i in the decimated grid flattened
+    row-major; the N_POINTS - len(kept) points after them are padding."""
+    xyz = xyz_grid[::RING_STRIDE, ::COL_STRIDE].reshape(-1, 3)
+    assert xyz.shape[0] == N_POINTS, f"decimation produced {xyz.shape[0]}, expected {N_POINTS}"
+
+    kept = np.flatnonzero(np.isfinite(xyz).all(axis=-1))
+    xyz = xyz[kept]
+    cls = None if cls_grid is None else cls_grid[::RING_STRIDE, ::COL_STRIDE].reshape(-1)[kept]
+
+    n_missing = N_POINTS - len(kept)
+    if n_missing > 0:
+        pad_idx = np.random.default_rng(pad_seed).choice(len(kept), size=n_missing, replace=True)
+        xyz = np.concatenate([xyz, xyz[pad_idx]], axis=0)
+        if cls is not None:
+            cls = np.concatenate([cls, cls[pad_idx]], axis=0)
+
+    return xyz.astype(np.float32), cls, kept
+
+
+def _load_raw(npz_path: Path, augment_rng: np.random.Generator | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """One recording -> decimated (xyz, class) point arrays, see prepare_points.
+
+    augment_rng: if given, injects synthetic real-sensor noise (see
+    real_noise_augment.py) into the raw grid before decimation -- pass this
+    only for TRAINING samples (never val/test), to close part of the
+    sim2real gap without needing any real labeled data."""
+    xyz, cls = load_grid(npz_path)
 
     if augment_rng is not None:
         from real_noise_augment import inject_real_sensor_noise
         xyz = inject_real_sensor_noise(xyz, augment_rng, cls_grid=cls)
 
-    xyz = xyz[::RING_STRIDE, ::COL_STRIDE].reshape(-1, 3)
-    cls = cls[::RING_STRIDE, ::COL_STRIDE].reshape(-1)
-    assert xyz.shape[0] == N_POINTS, f"decimation produced {xyz.shape[0]}, expected {N_POINTS}"
-
-    finite = np.isfinite(xyz).all(axis=-1)
-    xyz, cls = xyz[finite], cls[finite]
-
-    n_missing = N_POINTS - xyz.shape[0]
-    if n_missing > 0:
-        # zlib.crc32, not the builtin hash() -- str hashing is randomized
-        # per-process (PYTHONHASHSEED) unless disabled, which would make
-        # this padding non-reproducible run to run.
-        seed = zlib.crc32(npz_path.name.encode("utf-8"))
-        pad_idx = np.random.default_rng(seed).choice(
-            xyz.shape[0], size=n_missing, replace=True
-        )
-        xyz = np.concatenate([xyz, xyz[pad_idx]], axis=0)
-        cls = np.concatenate([cls, cls[pad_idx]], axis=0)
-
-    return xyz.astype(np.float32), cls
+    # zlib.crc32, not the builtin hash() -- str hashing is randomized
+    # per-process (PYTHONHASHSEED) unless disabled, which would make
+    # this padding non-reproducible run to run.
+    xyz, cls, _ = prepare_points(xyz, cls, pad_seed=zlib.crc32(npz_path.name.encode("utf-8")))
+    return xyz, cls
 
 
 class PointCloudDataset(Dataset):
