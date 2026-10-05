@@ -160,6 +160,54 @@ Consequence: the decoders' structure has **zero effect on the deployment latency
 above**. It only costs training time, on the Quadro, which has headroom — which is why
 the two decoders are free to be structured completely differently.
 
+### Deploying the trained encoder
+
+The repo ships one trained artifact: **`weights/pointnet2_epoch39_encoder.pt`** (1.4 MB,
+352,288 parameters), the encoder of the epoch-39 PointNet++ used for every result in the
+thesis. It is byte-for-byte the encoder inside the full epoch-39 multitask model, and
+`tests/test_shipped_weights.py` checks that it loads into a bare `PointNet2Encoder` and
+encodes a real-format scan to one finite 256-d latent. Everything else (full multitask
+models, fine-tunes) stays out of git; `train.py` regenerates it.
+
+On the edge device (see [Jetson AGX Orin](#jetson-agx-orin-inference-only) for installing
+PyTorch there), run from the repo root:
+
+```python
+import sys
+import torch
+sys.path.insert(0, "ros2_inference")
+from _shared_inference import real_scan_to_points
+from models.pointnet2 import PointNet2Encoder
+from sensor import check_sim_order, ouster_to_sim_order
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+encoder = PointNet2Encoder()
+encoder.load_state_dict(torch.load("weights/pointnet2_epoch39_encoder.pt",
+                                   map_location="cpu", weights_only=True))
+encoder.to(device).eval()
+
+# xyz_grid: one Ouster scan as the driver publishes it, (64, 1024, 3) float32
+check_sim_order(ouster_to_sim_order(xyz_grid))   # once per stream: refuses a misordered driver
+points, _ = real_scan_to_points(xyz_grid)        # (32768, 3), exactly what training fed the model
+with torch.no_grad():
+    latent, _ = encoder(torch.from_numpy(points).unsqueeze(0).to(device))   # (1, 256)
+```
+
+Two things are easy to get wrong:
+
+- **Never feed the raw Ouster grid to the encoder.** Its rows and columns run in a
+  different order from the simulator's, and PointNet++ builds its neighbourhoods from
+  array position, so a raw scan silently gives a different (worse) latent.
+  `real_scan_to_points` reorders, drops returns outside the simulated sensor's range and
+  pads to 32,768 points. See
+  [Real scans must reach the model the way simulated ones did](#real-scans-must-reach-the-model-the-way-simulated-ones-did).
+- **The encoder alone does not classify.** It outputs the 256-d observation for the
+  downstream policy. The per-point classes in the inference videos come from the
+  segmentation decoder, which is only in the full multitask model
+  (`outputs/pointnet2_checkpoints/epoch39_multitask_model.pt`, not in git).
+
+Latency on the Orin: `benchmarks/pointnet2_jetson_bench.py`, numbers in
+[Measured cost on the real Orin](#measured-cost-on-the-real-orin).
 
 ### Why the two decoders differ structurally
 
@@ -417,7 +465,9 @@ python3 train_salsanext.py       # SalsaNext
 ```
 
 Each saves `best_encoder.pt` (the only artifact that deploys), `best_multitask_model.pt`
-(kept for inspection/resume) and `train_metrics.json` to `outputs/<candidate>/`.
+(kept for inspection/resume) and `train_metrics.json` to `outputs/<candidate>/`. To ship a
+newly trained PointNet++, copy its `best_encoder.pt` into `weights/` (the one folder where
+`.pt` files are tracked) and rerun `tests/test_shipped_weights.py`.
 
 Checkpointing writes on **every** new best, not on a schedule — a `pip install` during a
 long run once killed training and cost the intermediate progress.
@@ -480,6 +530,7 @@ sim2real-lidar/
 ├── real_noise_augment.py   measured per-ring dropout, for sim2real fine-tuning
 ├── kevin_pipeline/
 │   └── fair_comparison.py  THE one script that puts all three on one scale
+├── weights/                pointnet2_epoch39_encoder.pt -- the trained encoder that deploys
 ├── sensor.py               Ouster <-> simulator scan order, the order check, range limits
 ├── ros2_inference/
 │   ├── _shared_inference.py    ModelRunner + real_scan_to_points, shared by both paths below
