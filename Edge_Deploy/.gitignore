@@ -1,0 +1,7 @@
+.idea/
+.venv/
+.venv_jetson/
+__pycache__/
+*.pyc
+.env
+.env.*

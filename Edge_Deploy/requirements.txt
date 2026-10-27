@@ -1,0 +1,8 @@
+# Desktop CUDA 12 environment only. Not for Jetson.
+--extra-index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.nvidia.com
+numpy==2.2.6
+torch==2.11.0+cu128
+onnx==1.19.1
+onnxruntime-gpu==1.23.2
+tensorrt-cu12==10.13.3.9
